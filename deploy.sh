@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# Z čerstvého Raspberry Pi OS udělá krabičku u trati.
+#
+# Jeden příkaz, žádné otázky. Co udělá:
+#
+#   1. doinstaluje, co chybí (cage, chromium, curl, avahi),
+#   2. nastaví jméno stroje a časové pásmo,
+#   3. nakopíruje agenta do /opt a zapne ho jako službu,
+#   4. zapne displej (kiosk) jako službu — bez plochy a bez přihlašování,
+#   5. zapne hardwarový watchdog a vypne zhasínání konzole,
+#   6. volitelně nastaví pevnou IP,
+#   7. na konci zkontroluje, že obojí běží, a napíše, co zbývá.
+#
+# Použití:
+#
+#   sudo bash deploy.sh
+#   sudo bash deploy.sh --hostname krabicka-brno \
+#                       --static-ip 192.168.9.10/24 --gateway 192.168.9.1
+#   bash deploy.sh --dry-run       # jen vypíše, co by udělal
+#
+# Přes `bash`, ne `./deploy.sh`: kopírování na Pi umí souboru sebrat právo
+# ke spuštění a `sudo ./deploy.sh` pak hlásí „command not found".
+#
+# Skript se dá pouštět opakovaně — je to nastavení, ne instalace. Token
+# krabičky se **nikdy nepřepisuje**: obsluha ho má opsaný v aplikaci.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR=/opt/event-control-agent
+AGENT_SERVICE=event-control-agent
+KIOSK_SERVICE=event-control-kiosk
+TIMEZONE_DEFAULT="Europe/Prague"
+
+# Aplikace běží na jednom místě, takže se adresa nikde nevypisuje. `--server`
+# zůstává kvůli zkouškám a vlastnímu serveru.
+SERVER="https://bikody.com"
+HOSTNAME_NEW=""
+TIMEZONE="$TIMEZONE_DEFAULT"
+STATIC_IP=""
+GATEWAY=""
+DNS="1.1.1.1"
+WITH_KIOSK=1
+DRY_RUN=0
+KIOSK_REZIM="zadny"      # plocha | systemd | zadny — podle toho, co drží obrazovku
+
+usage() {
+    sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --server)     SERVER="${2:-}"; shift 2 ;;
+        --hostname)   HOSTNAME_NEW="${2:-}"; shift 2 ;;
+        --timezone)   TIMEZONE="${2:-}"; shift 2 ;;
+        --static-ip)  STATIC_IP="${2:-}"; shift 2 ;;
+        --gateway)    GATEWAY="${2:-}"; shift 2 ;;
+        --dns)        DNS="${2:-}"; shift 2 ;;
+        --no-kiosk)   WITH_KIOSK=0; shift ;;
+        --dry-run)    DRY_RUN=1; shift ;;
+        -h|--help)    usage 0 ;;
+        *) echo "Neznámý přepínač: $1" >&2; usage 1 ;;
+    esac
+done
+
+# --- pomůcky ---------------------------------------------------------------
+
+krok()  { printf '\n\033[1m▶ %s\033[0m\n' "$*"; }
+info()  { printf '  %s\n' "$*"; }
+varuj() { printf '  \033[33m! %s\033[0m\n' "$*"; }
+
+# Každý zásah do systému jde přes `spust`, takže `--dry-run` je opravdu
+# nanečisto — a zároveň je z výpisu vidět, co přesně se s Pi stalo.
+spust() {
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '  \033[2m$ %s\033[0m\n' "$*"
+        return 0
+    fi
+    "$@"
+}
+
+zapis() {
+    local cesta="$1" obsah="$2"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '  \033[2m$ zapsat %s (%d B)\033[0m\n' "$cesta" "${#obsah}"
+        return 0
+    fi
+    printf '%s' "$obsah" > "$cesta"
+}
+
+if [[ $DRY_RUN -eq 0 && $EUID -ne 0 ]]; then
+    echo "Spusťte přes sudo: sudo $0 $*" >&2
+    exit 1
+fi
+
+if [[ $DRY_RUN -eq 0 && ! -f /etc/rpi-issue && ! -f /boot/firmware/config.txt ]]; then
+    varuj "Tohle nevypadá na Raspberry Pi OS — pokračuji, ale watchdog a"
+    varuj "vypnutí zhasínání konzole se nejspíš nepovedou."
+fi
+
+# Uživatel, pod kterým poběží displej. Kiosk potřebuje mít kde mít svůj
+# runtime adresář, takže běží jako konkrétní člověk, ne jako root.
+DESKTOP_USER="${SUDO_USER:-${USER:-pi}}"
+[[ "$DESKTOP_USER" == "root" ]] && DESKTOP_USER="pi"
+
+echo "Event Control — nastavení krabičky u trati"
+[[ $DRY_RUN -eq 1 ]] && echo "(nanečisto — nic se nemění)"
+
+# --- 1. balíčky ------------------------------------------------------------
+
+krok "Balíčky"
+CHYBI=()
+command -v curl >/dev/null || CHYBI+=(curl)
+command -v python3 >/dev/null || CHYBI+=(python3)
+if [[ $WITH_KIOSK -eq 1 ]]; then
+    command -v chromium-browser >/dev/null || command -v chromium >/dev/null || CHYBI+=(chromium-browser)
+    # Podle grafiky: s KMS (/dev/dri) kreslí `cage`. Malé SPI displeje
+    # (MHS35 a spol.) mají jen framebuffer — tam Wayland nemá GPU a je
+    # potřeba X server s ovladačem fbdev.
+    if [[ -d /dev/dri ]]; then
+        command -v cage >/dev/null || CHYBI+=(cage)
+    elif [[ -e /dev/fb0 ]]; then
+        command -v xinit >/dev/null || CHYBI+=(xinit xserver-xorg xserver-xorg-video-fbdev xserver-xorg-legacy)
+    else
+        command -v cage >/dev/null || CHYBI+=(cage)
+    fi
+fi
+command -v avahi-daemon >/dev/null || CHYBI+=(avahi-daemon)
+
+if [[ ${#CHYBI[@]} -gt 0 ]]; then
+    info "doinstaluji: ${CHYBI[*]}"
+    spust apt-get update -qq
+    spust apt-get install -y -qq "${CHYBI[@]}"
+else
+    info "všechno je nainstalované"
+fi
+
+# --- 2. jméno stroje a čas -------------------------------------------------
+
+krok "Jméno stroje a časové pásmo"
+if [[ -n "$HOSTNAME_NEW" ]]; then
+    spust hostnamectl set-hostname "$HOSTNAME_NEW"
+    info "jméno: $HOSTNAME_NEW (dostupná jako $HOSTNAME_NEW.local)"
+else
+    info "jméno ponecháno: $(hostname)"
+fi
+spust timedatectl set-timezone "$TIMEZONE"
+info "časové pásmo: $TIMEZONE"
+
+# --- 3. ovladač displeje ----------------------------------------------------
+#
+# 3,5" SPI displej (MHS35) potřebuje overlay v /boot a dva řádky v config.txt.
+# Bez nich po zapnutí svítí bíle a systém o něm neví. Krabička s HDMI nebo
+# oficiálním DSI displejem tenhle krok přeskočí — pozná se to podle toho, že
+# překryv není potřeba: overlay se instaluje, jen když v configu žádný
+# displej nastavený není.
+
+REBOOT_KVULI_DISPLEJI=0
+if [[ $WITH_KIOSK -eq 1 && -f /boot/firmware/config.txt ]]; then
+    krok "Ovladač displeje"
+    if grep -q "^dtoverlay=mhs35" /boot/firmware/config.txt; then
+        info "MHS35 už je v config.txt"
+    elif [[ -d /dev/dri || -e /dev/fb0 ]]; then
+        info "displej už funguje — ovladač neměním"
+    else
+        spust install -m 755 "$ROOT/display/mhs35.dtbo" /boot/firmware/overlays/mhs35.dtbo
+        grep -q "^dtparam=spi=on" /boot/firmware/config.txt \
+            || spust bash -c 'echo "dtparam=spi=on" >> /boot/firmware/config.txt'
+        spust bash -c 'echo "dtoverlay=mhs35:rotate=90" >> /boot/firmware/config.txt'
+        REBOOT_KVULI_DISPLEJI=1
+        info "MHS35 nainstalován (projeví se po restartu)"
+    fi
+fi
+
+# --- 4. agent ---------------------------------------------------------------
+
+krok "Agent"
+spust install -d -m 755 "$INSTALL_DIR"
+spust install -m 755 "$ROOT/agent/track_agent.py" "$INSTALL_DIR/track_agent.py"
+spust install -m 644 "$ROOT/systemd/$AGENT_SERVICE.service" "/etc/systemd/system/$AGENT_SERVICE.service"
+
+# Adresa aplikace se zapíše rovnou, takže krabička po zapnutí ukáže token
+# a nemusí se na ní nic nastavovat. Token se nikdy nepřepisuje — obsluha ho
+# má opsaný v aplikaci a tichá výměna by krabičku odpojila.
+if [[ -n "$SERVER" ]]; then
+    if [[ -f "$INSTALL_DIR/config.json" ]]; then
+        info "adresa aplikace: $SERVER (token zůstává)"
+        spust python3 - "$INSTALL_DIR/config.json" "$SERVER" <<'PY'
+import json, sys
+cesta, server = sys.argv[1], sys.argv[2]
+data = json.load(open(cesta))
+data["server"] = server
+json.dump(data, open(cesta, "w"), indent=2)
+PY
+    else
+        info "adresa aplikace: $SERVER (token si krabička vyrobí sama)"
+        zapis "$INSTALL_DIR/config.json" "$(printf '{\n  "server": "%s",\n  "token": "",\n  "autostart": false\n}\n' "$SERVER")"
+        spust chmod 600 "$INSTALL_DIR/config.json"
+    fi
+fi
+
+spust systemctl daemon-reload
+spust systemctl enable "$AGENT_SERVICE"
+# Restart, ne `enable --now`: běžící službu by `--now` nechal být a nová
+# verze agenta by se načetla až po ručním restartu — přitom právě proto se
+# skript pouští podruhé.
+spust systemctl restart "$AGENT_SERVICE"
+info "služba $AGENT_SERVICE zapnuta"
+
+# --- 5. displej (kiosk) -----------------------------------------------------
+
+if [[ $WITH_KIOSK -eq 1 ]]; then
+    krok "Displej (kiosk)"
+    spust install -m 755 "$ROOT/kiosk/start-kiosk.sh" "$INSTALL_DIR/start-kiosk.sh"
+    spust install -m 755 "$ROOT/kiosk/kiosk-x-session.sh" "$INSTALL_DIR/kiosk-x-session.sh"
+
+    if [[ ! -d /dev/dri && -e /dev/fb0 ]]; then
+        info "SPI displej bez KMS — kiosk pojede přes X na /dev/fb0"
+        spust install -d -m 755 /etc/X11/xorg.conf.d
+        spust install -m 644 "$ROOT/kiosk/99-event-control-fbdev.conf" \
+            /etc/X11/xorg.conf.d/99-event-control-fbdev.conf
+        # X spouští služba, ne přihlášený člověk u konzole — bez tohohle by
+        # wrapper start odmítl („Only console users are allowed").
+        zapis /etc/X11/Xwrapper.config \
+"allowed_users=anybody
+needs_root_rights=yes
+"
+    fi
+
+    # Dvě cesty, protože Raspberry Pi OS je dvojí. Rozhoduje to, jestli systém
+    # startuje do plochy: ta si obrazovku vezme sama a `cage` by se s ní pral —
+    # displej pak bliká, jak systemd každé tři vteřiny zvedá poraženého.
+    if [[ "$(systemctl get-default 2>/dev/null)" == "graphical.target" ]]; then
+        KIOSK_REZIM="plocha"
+        info "systém startuje do plochy — kiosk poběží uvnitř ní"
+        # Ať po předchozím běhu nezůstane služba, která se o obrazovku pere.
+        if systemctl is-enabled --quiet "$KIOSK_SERVICE@$DESKTOP_USER" 2>/dev/null; then
+            spust systemctl disable --now "$KIOSK_SERVICE@$DESKTOP_USER"
+        fi
+        DESKTOP_HOME="$(getent passwd "$DESKTOP_USER" 2>/dev/null | cut -d: -f6 || true)"
+        DESKTOP_HOME="${DESKTOP_HOME:-/home/$DESKTOP_USER}"
+        spust install -d -m 755 -o "$DESKTOP_USER" -g "$DESKTOP_USER" \
+            "$DESKTOP_HOME/.config/autostart"
+        spust install -m 644 -o "$DESKTOP_USER" -g "$DESKTOP_USER" \
+            "$ROOT/kiosk/event-control-kiosk.desktop" \
+            "$DESKTOP_HOME/.config/autostart/event-control-kiosk.desktop"
+        info "spustí se s plochou uživatele $DESKTOP_USER (po odhlášení a přihlášení)"
+        varuj "Krabička plochu nepotřebuje. Bez ní naběhne displej sama po zapnutí:"
+        varuj "    sudo systemctl set-default multi-user.target && sudo reboot"
+    else
+        KIOSK_REZIM="systemd"
+        spust install -m 644 "$ROOT/systemd/$KIOSK_SERVICE.service" \
+            "/etc/systemd/system/$KIOSK_SERVICE@.service"
+        spust systemctl daemon-reload
+        spust systemctl enable "$KIOSK_SERVICE@$DESKTOP_USER"
+        # Po smyčce restartů zůstane služba „failed" a systemd ji odmítne
+        # spustit, dokud se počítadlo nesmaže.
+        spust systemctl reset-failed "$KIOSK_SERVICE@$DESKTOP_USER" 2>/dev/null || true
+        spust systemctl restart "$KIOSK_SERVICE@$DESKTOP_USER"
+        spust loginctl enable-linger "$DESKTOP_USER"
+        info "běží pod uživatelem $DESKTOP_USER, bez plochy a bez přihlašování"
+    fi
+else
+    krok "Displej přeskočen (--no-kiosk)"
+fi
+
+# --- 6. krabička, která se o sebe stará ------------------------------------
+
+krok "Odolnost"
+if [[ ! -f /boot/firmware/cmdline.txt ]]; then
+    varuj "/boot/firmware/cmdline.txt neexistuje — zhasínání konzole neřeším"
+elif grep -q "consoleblank=0" /boot/firmware/cmdline.txt; then
+    info "zhasínání konzole už je vypnuté"
+else
+    spust sed -i '1 s/$/ consoleblank=0/' /boot/firmware/cmdline.txt
+    info "vypnuto zhasínání konzole (po restartu)"
+fi
+
+if [[ ! -f /boot/firmware/config.txt ]]; then
+    varuj "/boot/firmware/config.txt neexistuje — watchdog neřeším"
+elif grep -q "^dtparam=watchdog=on" /boot/firmware/config.txt; then
+    info "watchdog už je zapnutý"
+else
+    spust bash -c 'echo "dtparam=watchdog=on" >> /boot/firmware/config.txt'
+    info "zapnut hardwarový watchdog (po restartu)"
+fi
+
+spust install -d -m 755 /etc/systemd/system.conf.d
+zapis /etc/systemd/system.conf.d/event-control-watchdog.conf \
+"# Krabička u trati běží bez obsluhy: když zamrzne, restartuje se sama.
+[Manager]
+RuntimeWatchdogSec=30
+RebootWatchdogSec=2min
+"
+
+# Log na SD kartě neroste donekonečna — karta se u trati vytahuje ze zásuvky
+# a plný disk by krabičku položil dřív než cokoli jiného.
+# Raspberry Pi Connect na krabičce nemá co dělat — a bez přihlášení se točí
+# v havarijní smyčce („Sign in failed") stovkykrát za minutu: journald mele
+# naprázdno, CPU topí a ventilátor jede naplno, i když „nic neběží".
+if command -v rpi-connect >/dev/null; then
+    info "vypínám Raspberry Pi Connect (krabička ho nepoužívá)"
+    spust runuser -u "$DESKTOP_USER" -- env XDG_RUNTIME_DIR="/run/user/$(id -u "$DESKTOP_USER")" \
+        rpi-connect off || true
+fi
+
+spust install -d -m 755 /etc/systemd/journald.conf.d
+zapis /etc/systemd/journald.conf.d/event-control.conf \
+"[Journal]
+SystemMaxUse=50M
+"
+info "log omezen na 50 MB, watchdog na 30 s"
+
+# --- 7. síť ----------------------------------------------------------------
+
+if [[ -n "$STATIC_IP" ]]; then
+    krok "Pevná adresa"
+    if [[ -z "$GATEWAY" ]]; then
+        echo "K --static-ip patří i --gateway." >&2
+        exit 1
+    fi
+    # Přes `bash`, ne přímo: kopírování na Pi (scp, rozbalený archiv, klon
+    # s vypnutým core.fileMode) umí sebrat právo ke spuštění a skript by
+    # spadl na „Permission denied" až tady, uprostřed nastavování.
+    spust bash "$ROOT/scripts/set-static-ip.sh" "$STATIC_IP" "$GATEWAY" "$DNS"
+fi
+
+# --- 8. kontrola -----------------------------------------------------------
+
+krok "Kontrola"
+SLUZBY=("$AGENT_SERVICE")
+[[ "$KIOSK_REZIM" == "systemd" ]] && SLUZBY+=("$KIOSK_SERVICE@$DESKTOP_USER")
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    info "nanečisto — služby se nespouštěly"
+else
+    for SLUZBA in "${SLUZBY[@]}"; do
+        if systemctl is-active --quiet "$SLUZBA"; then
+            info "$SLUZBA běží"
+        else
+            varuj "$SLUZBA neběží — podívejte se: journalctl -u $SLUZBA -n 30"
+        fi
+    done
+fi
+
+# `|| true`, protože `hostname -I` zná Linux, ale ne každý systém — a se
+# zapnutým `pipefail` by na tom celý skript skončil těsně před tím, co má
+# obsluha přečíst.
+IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+NAZEV="$(hostname)"
+NAZEV="${NAZEV%.local}"      # mDNS jméno se skládá níž, ať tam není dvakrát
+cat <<INFO
+
+Hotovo.
+
+  Displej krabičky:  http://${IP:-<ip-krabicky>}:8088/   (nebo http://$NAZEV.local:8088/)
+  Nastavení:         http://${IP:-<ip-krabicky>}:8088/nastaveni
+
+Po zapnutí zdroje najede agent i displej samy, bez přihlašování. Hlásí se na
+$SERVER, takže zbývá jediný krok:
+
+  token z displeje opsat v aplikaci: Nastavení aplikace → Přihlásit krabičku.
+INFO
+echo
+for SLUZBA in "${SLUZBY[@]}"; do
+    echo "  stav:  systemctl status $SLUZBA"
+done
+cat <<INFO
+  log:   journalctl -u $AGENT_SERVICE -f
+
+Watchdog a vypnuté zhasínání se projeví po restartu: sudo reboot
+INFO
+if [[ $REBOOT_KVULI_DISPLEJI -eq 1 ]]; then
+    echo
+    varuj "Nainstaloval se ovladač displeje — displej se rozsvítí až po: sudo reboot"
+fi

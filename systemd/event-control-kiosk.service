@@ -1,0 +1,47 @@
+# Displej krabičky — stránka agenta přes celou obrazovku, hned po zapnutí.
+#
+# **Bez plochy a bez přihlášení.** Kdyby kiosk visel na desktopové relaci,
+# musel by se někdo přihlásit (nebo by se muselo zapnout autologin) a po
+# zapnutí zdroje by obrazovka zůstala u přihlašovacího okna. `cage` je
+# minimální Wayland kompozitor: nastartuje na tty1 a spustí v něm prohlížeč.
+#
+# Agent běží ve své vlastní službě a na tomhle nezávisí: když displej zhasne
+# nebo se prohlížeč rozbije, časomíra jede dál.
+[Unit]
+Description=Event Control — displej krabičky
+Documentation=https://github.com/CaveBushman/event-control-ri5
+After=event-control-agent.service systemd-user-sessions.service
+Wants=event-control-agent.service
+ConditionPathExists=/dev/tty1
+
+# tty1 může mít jen jeden. Bez tohohle řádku ho drží přihlašovací `getty`:
+# kiosk ho při startu odpojí (`TTYVHangup`), systemd getty hned zvedne, ten
+# udělá totéž a pošle **SIGHUP kiosku**. Ten umře, systemd ho za tři vteřiny
+# zvedne — a takhle pořád dokola. Na displeji je z toho blikání a v logu
+# „code=killed, signal=HUP" s rostoucím počítadlem restartů.
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+
+[Service]
+Type=simple
+User=%i
+PAMName=login
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+StandardInput=tty-fail
+StandardOutput=journal
+StandardError=journal
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=WLR_LIBINPUT_NO_DEVICES=1
+ExecStart=/opt/event-control-agent/start-kiosk.sh
+# Prohlížeč u trati nikdo nezavírá, ale kdyby spadl, černá obrazovka vypadá
+# jako rozbitá krabička.
+Restart=always
+RestartSec=3
+# Prohlížeč na SIGTERM občas neumírá; čekat na něj 90 s znamená, že restart
+# kiosku vypadá jako zamrzlá krabička.
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

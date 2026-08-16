@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BIKODY.COM – Server Status</title>
+
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <style>
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      background: #050505;
+      overflow: hidden;
+    }
+
+    body {
+      font-family: Arial, Helvetica, sans-serif;
+    }
+
+    .screen-bg {
+      background:
+        radial-gradient(circle at 50% 30%, rgba(38, 38, 38, 0.28), transparent 45%),
+        linear-gradient(180deg, #090b0c 0%, #050607 100%);
+    }
+
+    .token-grid {
+      background-image: radial-gradient(rgba(87, 255, 36, 0.16) 1px, transparent 1px);
+      background-size: 7px 7px;
+    }
+
+    .status-glow {
+      text-shadow: 0 0 10px rgba(80, 255, 30, 0.35);
+    }
+
+    .token-glow {
+      text-shadow: 0 0 8px rgba(80, 255, 30, 0.25);
+    }
+  </style>
+</head>
+
+<body class="text-white">
+  <main class="screen-bg w-screen h-screen flex items-center justify-center p-3 sm:p-4">
+    <section class="w-full h-full max-w-[900px] max-h-[520px] rounded-[28px] border border-zinc-700/60 bg-black/80 shadow-2xl p-4 sm:p-6">
+      <div class="w-full h-full rounded-[20px] border border-zinc-800 bg-black/40 px-5 sm:px-8 py-5 sm:py-7 flex flex-col">
+
+        <!-- Logo -->
+        <header class="text-center border-b border-zinc-800 pb-4 sm:pb-5">
+          <h1 class="font-black tracking-[0.14em] text-[clamp(2rem,7vw,4.6rem)] leading-none">
+            BIKODY<span class="text-red-500">.</span>COM
+          </h1>
+        </header>
+
+        <!-- Server status -->
+        <section class="flex-1 flex flex-col items-center justify-center border-b border-zinc-800 py-4">
+          <p class="uppercase tracking-[0.08em] text-zinc-200 font-semibold text-[clamp(1rem,2.5vw,1.8rem)]">
+            Stav serveru:
+          </p>
+
+          <div class="mt-3 flex items-center gap-5 sm:gap-8">
+            <div class="w-20 h-20 sm:w-28 sm:h-28 rounded-full border-[5px] border-lime-500 flex items-center justify-center status-glow">
+              <svg viewBox="0 0 24 24" class="w-12 h-12 sm:w-16 sm:h-16 text-lime-500" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M5 12.5l4.2 4.2L19 7" />
+              </svg>
+            </div>
+
+            <div class="text-lime-500 font-black text-[clamp(3.5rem,10vw,7rem)] leading-none status-glow">
+              OK
+            </div>
+          </div>
+        </section>
+
+        <!-- Token -->
+        <section class="pt-4 sm:pt-5">
+          <p class="text-center uppercase tracking-[0.08em] text-zinc-200 font-semibold text-[clamp(1rem,2.2vw,1.6rem)]">
+            Token:
+          </p>
+
+          <div class="token-grid mt-3 rounded-2xl border-2 border-lime-500/80 px-4 py-4 sm:px-6 sm:py-5 text-center">
+            <code id="token" class="block font-mono font-bold tracking-[0.09em] text-lime-500 text-[clamp(1rem,3vw,2.2rem)] token-glow break-all">
+              F4D8-7C21-9B6E-3A14-KM92-TR7Q
+            </code>
+          </div>
+
+          <div class="mt-4 flex items-center justify-center gap-2 text-zinc-400 text-[clamp(0.72rem,1.7vw,1rem)]">
+            <svg viewBox="0 0 24 24" class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M20 6v5h-5" />
+              <path d="M4 18v-5h5" />
+              <path d="M18.5 9A7 7 0 0 0 6 7l-2 4" />
+              <path d="M5.5 15A7 7 0 0 0 18 17l2-4" />
+            </svg>
+            <span>
+              AKTUALIZOVÁNO:
+              <span id="updatedAt">08.10.2025 12:34:56</span>
+            </span>
+          </div>
+        </section>
+
+      </div>
+    </section>
+  </main>
+
+  <script>
+    // Generátor náhodného tokenu pro ukázku / lokální použití.
+    function generateToken() {
+      const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+      const groups = 6;
+      const len = 4;
+      const parts = [];
+
+      for (let g = 0; g < groups; g++) {
+        let part = "";
+        for (let i = 0; i < len; i++) {
+          part += chars[Math.floor(Math.random() * chars.length)];
+        }
+        parts.push(part);
+      }
+
+      return parts.join("-");
+    }
+
+    function updateScreen() {
+      document.getElementById("token").textContent = generateToken();
+
+      const now = new Date();
+      const updated = now.toLocaleString("cs-CZ", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit"
+      });
+
+      document.getElementById("updatedAt").textContent = updated;
+    }
+
+    updateScreen();
+
+    // Volitelné: obnova tokenu každých 60 sekund.
+    setInterval(updateScreen, 60000);
+  </script>
+</body>
+</html>

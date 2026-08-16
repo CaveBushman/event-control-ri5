@@ -6,7 +6,8 @@ Krátký seznam pro obsluhu u trati. Podrobnosti jsou v `README.md`.
 
 1. **Zapojit** — napájení, ethernet do stejného switche jako dekodéry.
 2. **Podívat se na displej.** Do minuty má svítit zelená tečka a text
-   *připojen jako … (organizace)*.
+   *připojen jako … (organizace)*. Pod formulářem přibývají řádky spojení na
+   dekodéry a kameru — všechny mají být zelené.
 3. **V aplikaci** otevřít *Nastavení dekodérů* — u agenta má být zelená tečka
    a jméno krabičky. V horní liště mají svítit **Hill**, **Finish** a **Kamera**.
 4. **Dohledat MAC adresy** — když projde, vidí krabička na dekodéry.
@@ -30,8 +31,9 @@ průjezdy jsou v dekodérech i v aplikaci.
 
 | Co je vidět | Co s tím |
 |---|---|
-| Displej ukazuje *nenastaveno* | Vyplnit adresu aplikace a token z *Nastavení dekodérů*. |
-| *server token odmítl* | Někdo vydal nový token — vzít ho z aplikace a vložit znovu. |
+| Displej ukazuje *nenastaveno* | Vyplnit adresu aplikace a párovací kód z *Nastavení dekodérů* (tlačítko **Spárovat krabičku**). |
+| *Kód neplatí* | Kód platí půl hodiny a jen jednou — vydat v aplikaci nový. |
+| *server token odmítl* | Někdo vydal nový token — spárovat krabičku znovu. |
 | *server není k dispozici* | Krabička nemá internet. Zkontrolovat kabel a router. |
 | Kontrolky Hill/Finish jsou červené | Krabička nevidí dekodéry: jiná síť, vypnutý switch, nebo špatná IP v *Nastavení dekodérů*. |
 | Kamera červená | Software kamery neběží, nebo má jinou adresu než v *Nastavení aplikace*. |

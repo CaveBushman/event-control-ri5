@@ -20,11 +20,18 @@ xset s off -dpms || true
 command -v unclutter >/dev/null && unclutter -idle 0.5 -root &
 
 BROWSER="$(command -v chromium-browser || command -v chromium)"
-exec "$BROWSER" \
+
+# Prohlížeč se u trati nikdy neaktualizuje ani nezavírá sám — ale kdyby přesto
+# spadl, černá obrazovka vypadá jako rozbitá krabička. Proto smyčka: agent
+# běží dál pod systemd, tohle jen znovu ukáže jeho stránku.
+while true; do
+  "$BROWSER" \
     --kiosk \
     --incognito \
     --noerrdialogs \
     --disable-infobars \
     --disable-session-crashed-bubble \
     --check-for-update-interval=31536000 \
-    "$URL"
+    "$URL" || true
+  sleep 3
+done

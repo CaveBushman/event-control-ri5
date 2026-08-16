@@ -58,14 +58,19 @@ a stav se dá otevřít z notebooku v síti.
    Skript nainstaluje agenta do `/opt/event-control-agent`, zapne službu a
    nastaví kiosk na displeji. Trvá to minutu a nic se neptá.
 3. Na displeji (nebo z notebooku na `http://<ip-krabicky>:8088/`) vyplňte
-   **adresu aplikace** a **token**. Token vydá aplikace v *Nastavení dekodérů*
-   tlačítkem **Vydat token**.
+   **adresu aplikace** a **párovací kód**. Kód vydá aplikace v *Nastavení
+   dekodérů* tlačítkem **Spárovat krabičku**: osm znaků, platí půl hodiny
+   a použije se jednou — krabička si za něj sama vyzvedne token. Opisovat
+   třiačtyřicetiznakový token na dotykovém displeji nikdo nechce.
 4. Hotovo — tečka na stránce zezelená a v aplikaci se u agenta objeví jméno
    krabičky.
 
 ## Jak poznat, že to jede
 
 * Na displeji krabičky svítí zelená tečka a text *připojen jako … (organizace)*.
+* Pod formulářem přibývají řádky **posledních spojení** — kdy, kam a jak to
+  dopadlo. To je u trati nejrychlejší způsob, jak poznat, že dekodéry a kamera
+  odpovídají.
 * V aplikaci v **Nastavení dekodérů** je u agenta zelená tečka a jméno stroje.
 * V horní liště aplikace svítí kontrolky **Hill**, **Finish** a **Kamera**.
 * Tlačítko **Dohledat MAC adresy** projde i z produkce.

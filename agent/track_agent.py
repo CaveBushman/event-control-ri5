@@ -95,6 +95,23 @@ class Server:
 
 _pool: dict[tuple[str, int], socket.socket] = {}
 
+#: Posledních pár spojení na železo. Na displeji krabičky u trati je to jediné,
+#: podle čeho obsluha pozná, jestli se dekodéry a kamera ozývají — do aplikace
+#: se přes rameno nekouká.
+_recent: list[dict] = []
+_RECENT_MAX = 6
+
+
+def _remember(host: str, port: int, ok: bool, detail: str = "") -> None:
+    entry = {
+        "cil": f"{host}:{port}",
+        "ok": ok,
+        "detail": detail,
+        "cas": time.strftime("%H:%M:%S"),
+    }
+    _recent.insert(0, entry)
+    del _recent[_RECENT_MAX:]
+
 
 def _drop(key: tuple[str, int]) -> None:
     sock = _pool.pop(key, None)
@@ -221,13 +238,17 @@ def run_command(server: Server, command: dict) -> None:
     if action is None:
         server.result(command.get("id"), False, error=f"Neznámý příkaz {command.get('action')!r}.")
         return
+    args = command.get("args") or {}
+    host, port = str(args.get("host", "")), int(args.get("port") or 0)
     try:
-        data = action(command.get("args") or {})
+        data = action(args)
     except (OSError, TimeoutError, ValueError) as exc:
         # Nedostupné železo je běžný stav, ne pád agenta: server chybu ukáže
         # obsluze u rampy stejně, jako by se připojoval sám.
+        _remember(host, port, False, str(exc))
         server.result(command.get("id"), False, error=str(exc))
         return
+    _remember(host, port, True)
     server.result(command.get("id"), True, data=data)
 
 
@@ -451,6 +472,11 @@ _PAGE = """<!doctype html>
  input[type=text] {{ width:100%; box-sizing:border-box; height:40px; padding:0 12px; border-radius:10px;
          border:1px solid #1e2a36; background:#0d141b; color:#e6edf3; font-size:15px; }}
  .radek {{ display:flex; align-items:center; gap:8px; margin-top:16px; font-size:14px; color:#c9d5e1; }}
+ table {{ width:100%; border-collapse:collapse; margin-top:24px; font-size:13px; }}
+ th {{ text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.08em;
+       color:#8b98a5; font-weight:600; padding:0 0 6px; }}
+ td {{ padding:6px 0; border-top:1px solid #1e2a36; color:#c9d5e1; }}
+ td.stavbunka {{ color:#3fb950; }} td.stavbunka.chyba {{ color:#f85149; }}
  button {{ margin-top:20px; height:40px; padding:0 20px; border-radius:10px; border:0;
            background:#2f81f7; color:#fff; font-weight:600; font-size:15px; cursor:pointer; }}
  p.hint {{ color:#8b98a5; font-size:12px; line-height:1.5; }}
@@ -463,8 +489,13 @@ _PAGE = """<!doctype html>
  <form method="post">
   <label for="server">Adresa aplikace</label>
   <input type="text" id="server" name="server" value="{server}" placeholder="https://vas-server.cz">
-  <label for="token">Token z Nastavení dekodérů</label>
-  <input type="text" id="token" name="token" value="" placeholder="{token_hint}">
+  <label for="code">Párovací kód z aplikace</label>
+  <input type="text" id="code" name="code" value="" placeholder="ABCD-2345" autocapitalize="characters">
+  <p class="hint">V aplikaci: Nastavení dekodérů → <strong>Spárovat krabičku</strong>.
+    Kód platí půl hodiny a použije se jednou.</p>
+  <details><summary class="hint" style="cursor:pointer">Radši vložit celý token</summary>
+   <input type="text" id="token" name="token" value="" placeholder="{token_hint}" style="margin-top:8px">
+  </details>
   <div class="radek">
    <input type="checkbox" id="autostart" name="autostart" {autostart}>
    <label for="autostart" style="margin:0; text-transform:none; letter-spacing:0; font-size:14px;">
@@ -472,6 +503,7 @@ _PAGE = """<!doctype html>
   </div>
   <button type="submit">Uložit a připojit</button>
  </form>
+ {recent}
  <p class="hint">Token se ukládá do <code>{config}</code> a na stránce se už nezobrazuje —
    nový se vydává v aplikaci, v Nastavení dekodérů.</p>
 </main>
@@ -479,18 +511,69 @@ _PAGE = """<!doctype html>
 </body></html>"""
 
 
+def _recent_table() -> str:
+    """Poslední spojení na dekodéry a kameru — co je na displeji vidět."""
+    if not _recent:
+        return ""
+    rows = "".join(
+        "<tr><td>{cas}</td><td>{cil}</td>"
+        '<td class="stavbunka{trida}">{text}</td></tr>'.format(
+            cas=entry["cas"],
+            cil=entry["cil"],
+            trida="" if entry["ok"] else " chyba",
+            text="odpovědělo" if entry["ok"] else (entry["detail"] or "neodpovědělo"),
+        )
+        for entry in _recent
+    )
+    return (
+        "<table><tr><th>Kdy</th><th>Kam</th><th>Výsledek</th></tr>" + rows + "</table>"
+    )
+
+
 def _render_page(worker, config: dict) -> bytes:
     token = config.get("token") or ""
     page = _PAGE.format(
         muted="#6e7681",
         ok=" ok" if (worker and worker.connected) else "",
-        status=(worker.status if worker else "nenastaveno — doplňte adresu a token"),
+        status=(worker.status if worker else "nenastaveno — vyplňte adresu a párovací kód"),
         server=(config.get("server") or ""),
         token_hint=("uložený token: …" + token[-4:]) if token else "vložte token z aplikace",
         autostart="checked" if config.get("autostart") else "",
         config=config_path(),
+        recent=_recent_table(),
     )
     return page.encode("utf-8")
+
+
+def redeem_pair_code(server_url: str, code: str) -> str:
+    """Vymění párovací kód za token. Vrací token, nebo vyhodí `ValueError`.
+
+    Krabička u trati má dotykový displej: osm znaků se na něm napíše, token
+    o třiačtyřiceti ne.
+    """
+    request = urllib.request.Request(
+        f"{server_url.rstrip('/')}/bmx/api/agent/pair/",
+        data=json.dumps({"code": code}).encode("utf-8"),
+        method="POST",
+    )
+    request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            answer = json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = json.loads(exc.read() or b"{}").get("error", "")
+        except (ValueError, OSError):
+            pass
+        raise ValueError(detail or f"Server odpověděl {exc.code}.") from exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise ValueError(f"Server není k dispozici ({exc}).") from exc
+
+    token = answer.get("token") or ""
+    if not token:
+        raise ValueError("Server token neposlal.")
+    return token
 
 
 def build_web_server(state: dict, *, host: str, port: int):
@@ -512,7 +595,18 @@ def build_web_server(state: dict, *, host: str, port: int):
             self.wfile.write(body)
 
         def do_GET(self):              # noqa: N802 — jméno určuje knihovna
-            self._send(_render_page(state.get("worker"), load_config()))
+            page = _render_page(state.get("worker"), load_config())
+            problem = state.pop("chyba", "")
+            if problem:
+                # Chyba párování se ukáže jednou; při dalším načtení už by
+                # jen mátla, protože se mezitím mohlo povést.
+                page = page.replace(
+                    b'<form method="post">',
+                    ('<div class="stav"><span class="tecka"></span><span>'
+                     f'{problem}</span></div><form method="post">').encode("utf-8"),
+                    1,
+                )
+            self._send(page)
 
         def do_POST(self):             # noqa: N802
             length = int(self.headers.get("Content-Length") or 0)
@@ -523,6 +617,16 @@ def build_web_server(state: dict, *, host: str, port: int):
             # nezobrazuje, takže by ho jinak každé uložení smazalo.
             token = (form.get("token", [""])[0] or "").strip() or saved.get("token", "")
             autostart = "autostart" in form
+
+            # Párovací kód má přednost: kdo ho zadal, chce nový token.
+            code = (form.get("code", [""])[0] or "").strip()
+            if code and server_url:
+                try:
+                    token = redeem_pair_code(server_url, code)
+                    log("Párování proběhlo, token uložen.")
+                except ValueError as exc:
+                    log(f"Párování selhalo: {exc}")
+                    state["chyba"] = str(exc)
 
             save_config(server_url, token, autostart=autostart)
             set_autostart(autostart)

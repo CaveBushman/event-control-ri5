@@ -736,6 +736,19 @@ def build_web_server(state: dict, *, host: str, port: int):
         def log_message(self, *_args):
             pass                       # vlastní log stačí, přístupy nikoho nezajímají
 
+        def handle(self):
+            """Klient, který odejde uprostřed odpovědi, není chyba.
+
+            Displej krabičky si stránku obnovuje sám a prohlížeč v kiosku se
+            po restartu odpojí bez rozloučení. Standardní knihovna z toho
+            sype dvacetiřádkový traceback do logu — a v logu krabičky u trati
+            má být vidět, co dělají dekodéry, ne tohle.
+            """
+            try:
+                super().handle()
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+
         def _send(self, body: bytes, status: int = 200, headers=()):
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -775,7 +788,22 @@ def build_web_server(state: dict, *, host: str, port: int):
                 state["worker"] = worker
             self._send(b"", status=303, headers=[("Location", "/nastaveni")])
 
-    return http.server.ThreadingHTTPServer((host, port), Handler)
+    class TichyServer(http.server.ThreadingHTTPServer):
+        """Odpojený klient se nehlásí jako chyba serveru.
+
+        `handle()` v handleru pokryje běžný případ, ale výjimka umí vzniknout
+        i dřív, než se handler vůbec dostane ke slovu. Log krabičky u trati má
+        zůstat čitelný — je to jediné, podle čeho se u trati hledá závada.
+        """
+
+        daemon_threads = True
+
+        def handle_error(self, request, client_address):
+            if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+                return
+            super().handle_error(request, client_address)
+
+    return TichyServer((host, port), Handler)
 
 
 def serve_web(state: dict, *, host: str, port: int) -> None:

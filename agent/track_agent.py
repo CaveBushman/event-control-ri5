@@ -12,8 +12,8 @@ Spuštění:
 
     python3 tools/track_agent.py --server https://vas-server.cz --token <token>
 
-Token vydá aplikace v Nastavení dekodérů. Dá se místo přepínačů vzít
-i z prostředí (`EVENT_CONTROL_SERVER`, `EVENT_CONTROL_AGENT_TOKEN`).
+Token vydá aplikace v Nastavení aplikace → Přihlásit krabičku. Dá se místo
+přepínačů vzít i z prostředí (`EVENT_CONTROL_SERVER`, `EVENT_CONTROL_AGENT_TOKEN`).
 
 Program je schválně **jen ze standardní knihovny**: na notebooku u trati se
 nemá co instalovat a nemá co se rozbít. Neví nic o P3 ani o formátu startovky
@@ -454,7 +454,7 @@ def set_autostart(enabled: bool) -> pathlib.Path | None:
 # --- token krabičky --------------------------------------------------------
 #
 # **Token si vyrábí krabička, ne server.** Na jejím displeji se ukáže a obsluha
-# ho opíše do aplikace (Nastavení dekodérů). Obráceně by se třiačtyřicetiznakový
+# ho opíše do aplikace (Nastavení aplikace → Přihlásit krabičku). Obráceně by se třiačtyřicetiznakový
 # řetězec opisoval na dotykovém displeji — a to nikdo nechce. Takhle se píše
 # tam, kde je klávesnice.
 #
@@ -621,7 +621,7 @@ _SETTINGS = """<!doctype html>
   <button type="submit">Uložit</button>
  </form>
  <p class="hint">Token krabičky: <code>{token}</code><br>
-   Opište ho v aplikaci do <strong>Nastavení dekodérů → Token krabičky</strong>.
+   Opište ho v aplikaci do <strong>Nastavení aplikace → Přihlásit krabičku</strong>.
    Uložený je v <code>{config}</code>.</p>
  {spojeni}
  <p class="hint"><a href="/">zpět na displej</a></p>
@@ -775,7 +775,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--token",
         default=os.environ.get("EVENT_CONTROL_AGENT_TOKEN", ""),
-        help="Token agenta z Nastavení dekodérů",
+        help="Token agenta z Nastavení aplikace",
     )
     parser.add_argument(
         "--headless",
@@ -801,7 +801,7 @@ def main(argv: list[str] | None = None) -> int:
     saved = load_config()
     server_url = args.server or saved.get("server", "")
     # Token si krabička vyrobí sama a ukáže ho na displeji; obsluha ho opíše
-    # v aplikaci do Nastavení dekodérů. Opačný směr by znamenal opisovat na
+    # v aplikaci do Nastavení aplikace. Opačný směr by znamenal opisovat na
     # dotykovém displeji, což nikdo nechce.
     token = args.token or ensure_token(saved)
 

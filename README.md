@@ -54,16 +54,27 @@ a stav se dá otevřít z notebooku v síti.
 2. Zkopírujte na Pi tenhle adresář (nebo `git clone`) a spusťte:
 
    ```bash
-   sudo ./scripts/install.sh
+   sudo ./deploy.sh --server https://vas-server.cz
    ```
 
-   Skript nainstaluje agenta do `/opt/event-control-agent`, zapne službu a
-   nastaví kiosk na displeji. Trvá to minutu a nic se neptá.
-3. V nastavení krabičky (`http://<ip-krabicky>:8088/nastaveni`, nebo odkaz
-   *nastavení* dole na displeji) vyplňte **adresu aplikace**.
-4. Na displeji se ukáže **token krabičky** — šest čtveřic znaků. Opište ho
-   v aplikaci do *Nastavení dekodérů* → **Přihlásit krabičku**.
-5. Do pěti vteřin naskočí na displeji velké zelené **OK**.
+   Jeden příkaz nastaví všechno: balíčky, agenta jako službu, displej,
+   watchdog i časové pásmo. Trvá to minutu a nic se neptá. Bez `--server` to
+   projde taky — adresa aplikace se pak vyplní na krabičce.
+3. Na displeji se ukáže **token krabičky** — šest čtveřic znaků. Opište ho
+   v aplikaci do *Nastavení aplikace* → **Přihlásit krabičku**.
+4. Do pěti vteřin naskočí na displeji velké zelené **OK**.
+
+Co skript umí navíc:
+
+```bash
+sudo ./deploy.sh --hostname krabicka-brno \
+                 --static-ip 192.168.9.10/24 --gateway 192.168.9.1
+./deploy.sh --dry-run          # jen vypíše, co by udělal, a nic nezmění
+sudo ./deploy.sh --no-kiosk    # krabička bez displeje
+```
+
+Pouštět se dá opakovaně — je to nastavení, ne instalace. **Token se přitom
+nikdy nepřepíše**, protože ho obsluha má opsaný v aplikaci.
 
 Token vyrábí krabička, ne aplikace: na dotykovém displeji se nic nepíše,
 opisuje se tam, kde je klávesnice. **Přihlášená krabička token schová** —
@@ -119,7 +130,7 @@ Tři stavy, které displej ukazuje:
 * V nastavení krabičky přibývají řádky **posledních spojení** — kdy, kam a jak
   to dopadlo. To je u trati nejrychlejší způsob, jak poznat, že dekodéry
   a kamera odpovídají.
-* V aplikaci v **Nastavení dekodérů** je u agenta zelená tečka a jméno stroje.
+* V aplikaci v **Nastavení aplikace** je u agenta zelená tečka a jméno stroje.
 * V horní liště aplikace svítí kontrolky **Hill**, **Finish** a **Kamera**.
 * Tlačítko **Dohledat MAC adresy** projde i z produkce.
 * **Průjezdy naskakují do Parsingu** — to je ta hlavní věc, kvůli které

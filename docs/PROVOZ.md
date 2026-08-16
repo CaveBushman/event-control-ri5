@@ -8,7 +8,7 @@ Krátký seznam pro obsluhu u trati. Podrobnosti jsou v `README.md`.
    se nespouští, krabička najede sama.
 2. **Podívat se na displej.** Do minuty má svítit zelené **OK** a text
    *připojen jako … (organizace)*.
-3. **V aplikaci** otevřít *Nastavení dekodérů* — u agenta má být zelená tečka
+3. **V aplikaci** otevřít *Nastavení aplikace* — u agenta má být zelená tečka
    a jméno krabičky. V horní liště mají svítit **Hill**, **Finish** a **Kamera**.
 4. **Dohledat MAC adresy** — když projde, vidí krabička na dekodéry.
 
@@ -32,7 +32,7 @@ průjezdy jsou v dekodérech i v aplikaci.
 | Co je vidět | Co s tím |
 |---|---|
 | Displej ukazuje **NASTAVIT** | Chybí adresa aplikace — doplnit v nastavení krabičky. |
-| Displej ukazuje **ČEKÁ** | Token z displeje ještě není v aplikaci — opsat ho do *Nastavení dekodérů* → **Přihlásit krabičku**. |
+| Displej ukazuje **ČEKÁ** | Token z displeje ještě není v aplikaci — opsat ho do *Nastavení aplikace* → **Přihlásit krabičku**. |
 | **ČEKÁ** i po opsání | Překlep. Token se čte bez ohledu na pomlčky, mezery a malá písmena, ale znaky musí sedět. |
 | *server není k dispozici* | Krabička nemá internet. Zkontrolovat kabel a router. |
 | Kontrolky Hill/Finish jsou červené | Krabička nevidí dekodéry: jiná síť, vypnutý switch, nebo špatná IP v *Nastavení dekodérů*. |
@@ -53,5 +53,5 @@ Program agenta se dá spustit na notebooku u trati — je to tentýž soubor:
 python3 track_agent.py
 ```
 
-Stáhne se v aplikaci v *Nastavení dekodérů* odkazem **Stáhnout agenta**.
+Stáhne se v aplikaci v *Nastavení aplikace* odkazem **Stáhnout agenta**.
 Nastavení se pak zadává na `http://127.0.0.1:8088/`.

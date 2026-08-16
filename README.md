@@ -151,7 +151,9 @@ z CDN: u trati se nespoléhá na nic, co se stahuje).
 
 ## Odkud se bere agent
 
-Zdrojem pravdy je hlavní repozitář Event Control, soubor `tools/track_agent.py`.
+Zdrojem pravdy je hlavní repozitář aplikace
+([CaveBushman/event-control](https://github.com/CaveBushman/event-control)),
+soubor `tools/track_agent.py` — tam se agent vyvíjí a tam je pokrytý testy.
 Tady je jeho kopie v `agent/track_agent.py`, aby se krabička dala postavit
 i bez přístupu k němu. `scripts/update.sh` si stáhne aktuální verzi přímo
 z vašeho serveru.

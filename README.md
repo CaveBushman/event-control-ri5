@@ -57,20 +57,43 @@ a stav se dá otevřít z notebooku v síti.
 
    Skript nainstaluje agenta do `/opt/event-control-agent`, zapne službu a
    nastaví kiosk na displeji. Trvá to minutu a nic se neptá.
-3. Na displeji (nebo z notebooku na `http://<ip-krabicky>:8088/`) vyplňte
-   **adresu aplikace** a **párovací kód**. Kód vydá aplikace v *Nastavení
-   dekodérů* tlačítkem **Spárovat krabičku**: osm znaků, platí půl hodiny
-   a použije se jednou — krabička si za něj sama vyzvedne token. Opisovat
-   třiačtyřicetiznakový token na dotykovém displeji nikdo nechce.
-4. Hotovo — tečka na stránce zezelená a v aplikaci se u agenta objeví jméno
-   krabičky.
+3. V nastavení krabičky (`http://<ip-krabicky>:8088/nastaveni`, nebo odkaz
+   *nastavení* dole na displeji) vyplňte **adresu aplikace**.
+4. Na displeji se ukáže **token krabičky** — šest čtveřic znaků. Opište ho
+   v aplikaci do *Nastavení dekodérů* → **Přihlásit krabičku**.
+5. Do pěti vteřin naskočí na displeji velké zelené **OK**.
+
+Token vyrábí krabička, ne aplikace: na dotykovém displeji se nic nepíše,
+opisuje se tam, kde je klávesnice. **Přihlášená krabička token schová** —
+zůstane z něj jen začátek a konec, protože klíč do klubové sítě nemá viset
+celý den na obrazovce u trati. Celý je v jejím nastavení.
+
+## Co je na displeji
+
+```
+                 BIKODY.COM
+              STAV SERVERU:
+                ✓   OK          ← zelená: hlásí se aplikaci
+     připojen jako … (organizace)
+             TOKEN KRABIČKY:
+             AKUW–…–7G59
+   AKTUALIZOVÁNO: 16.08.2026 21:11:43 · nastavení
+```
+
+Tři stavy, které displej ukazuje:
+
+| Stav | Co znamená |
+|---|---|
+| **NASTAVIT** (žlutá) | Chybí adresa aplikace — doplňte ji v nastavení krabičky. |
+| **ČEKÁ** (žlutá) | Token je vidět celý; opište ho v aplikaci. |
+| **OK** (zelená) | Krabička se hlásí aplikaci a přeposílá data. |
 
 ## Jak poznat, že to jede
 
-* Na displeji krabičky svítí zelená tečka a text *připojen jako … (organizace)*.
-* Pod formulářem přibývají řádky **posledních spojení** — kdy, kam a jak to
-  dopadlo. To je u trati nejrychlejší způsob, jak poznat, že dekodéry a kamera
-  odpovídají.
+* Na displeji krabičky svítí zelené **OK** a text *připojen jako … (organizace)*.
+* V nastavení krabičky přibývají řádky **posledních spojení** — kdy, kam a jak
+  to dopadlo. To je u trati nejrychlejší způsob, jak poznat, že dekodéry
+  a kamera odpovídají.
 * V aplikaci v **Nastavení dekodérů** je u agenta zelená tečka a jméno stroje.
 * V horní liště aplikace svítí kontrolky **Hill**, **Finish** a **Kamera**.
 * Tlačítko **Dohledat MAC adresy** projde i z produkce.
@@ -113,11 +136,18 @@ přestala odpovídat.
 Token je **heslo do vaší klubové sítě**: kdo ho má, může přes krabičku otevřít
 TCP spojení kamkoliv v ní. Proto:
 
-* stránka krabičky token nikdy nezobrazuje celý, jen poslední čtyři znaky;
+* přihlášená krabička token na displeji nezobrazuje celý;
 * nastavení je v `/opt/event-control-agent/config.json` s právy `600`;
-* nový token vydaný v aplikaci ten starý okamžitě zneplatní;
+* nový token se vyrábí jen na výslovné přání v nastavení krabičky (tichá
+  výměna by ji odpojila) a musí se pak znovu opsat v aplikaci;
 * stránka krabičky je dostupná v celé místní síti (proto se na ni dostanete
   z notebooku) — nepatří tedy do veřejné wifi pro diváky.
+
+## Návrh displeje
+
+Podoba obrazovky vychází z `docs/navrh-displeje.html` — zadání, jak má
+krabička vypadat. Skutečný displej je vlastní stránka agenta (bez Tailwindu
+z CDN: u trati se nespoléhá na nic, co se stahuje).
 
 ## Odkud se bere agent
 

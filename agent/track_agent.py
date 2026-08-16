@@ -45,6 +45,10 @@ READ_TIMEOUT = 40.0
 RECONNECT_MIN = 1.0
 RECONNECT_MAX = 15.0
 
+#: Jak často se krabička ptá, jestli už ji někdo v aplikaci schválil. Obsluha
+#: mezitím opisuje token z displeje, takže ani rychleji, ani líně.
+APPROVAL_POLL_SECONDS = 5.0
+
 
 def log(message: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
@@ -323,8 +327,13 @@ class Worker:
                 backoff = RECONNECT_MIN
             except urllib.error.HTTPError as exc:
                 if exc.code == 403:
-                    self._set("server token odmítl — zkontrolujte ho v aplikaci", connected=False)
-                    return
+                    # Token aplikace (zatím) nezná — přesně tenhle stav má
+                    # krabička po zapnutí, než ho někdo opíše do Nastavení
+                    # dekodérů. Není to chyba, je to čekání.
+                    greeted = False
+                    self._set("čeká na schválení v aplikaci", connected=False)
+                    self._stop.wait(APPROVAL_POLL_SECONDS)
+                    continue
                 greeted = False
                 self._set(f"server odpověděl {exc.code}, zkusím to znovu", connected=False)
                 self._stop.wait(backoff)
@@ -442,77 +451,185 @@ def set_autostart(enabled: bool) -> pathlib.Path | None:
     return path
 
 
-# --- obsluha přes prohlížeč ------------------------------------------------
+# --- token krabičky --------------------------------------------------------
+#
+# **Token si vyrábí krabička, ne server.** Na jejím displeji se ukáže a obsluha
+# ho opíše do aplikace (Nastavení dekodérů). Obráceně by se třiačtyřicetiznakový
+# řetězec opisoval na dotykovém displeji — a to nikdo nechce. Takhle se píše
+# tam, kde je klávesnice.
+#
+# Abeceda je bez znaků, které se na obrazovce pletou (0/O, 1/I/L), a token je
+# po čtveřicích: šest skupin = 120 bitů náhody, což na klíč do klubové sítě
+# stačí, a přitom se dá přečíst z metru.
+
+TOKEN_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+TOKEN_GROUPS = 6
+TOKEN_GROUP_LEN = 4
+
+
+def generate_token() -> str:
+    import secrets
+
+    groups = [
+        "".join(secrets.choice(TOKEN_ALPHABET) for _ in range(TOKEN_GROUP_LEN))
+        for _ in range(TOKEN_GROUPS)
+    ]
+    return "-".join(groups)
+
+
+def normalize_token(raw: str) -> str:
+    """Token z displeje — bez mezer a pomlček, velkými písmeny.
+
+    Obsluha ho opisuje z obrazovky, takže pomlčky vynechá, přidá mezery nebo
+    napíše malá písmena. Server i agent porovnávají stejně očištěný tvar.
+    """
+    return "".join(char for char in (raw or "").upper() if char.isalnum())
+
+
+def ensure_token(config: dict) -> str:
+    """Token krabičky — jednou vyrobený zůstává, dokud ho někdo nezmění."""
+    token = (config.get("token") or "").strip()
+    if token:
+        return token
+    token = generate_token()
+    save_config(config.get("server", ""), token, autostart=bool(config.get("autostart")))
+    log(f"Vyroben token krabičky: {token}")
+    return token
+
+
+# --- displej a obsluha přes prohlížeč --------------------------------------
 #
 # Agent nemá okno ani ikonu v liště: obojí by znamenalo knihovnu navíc pro
-# každý systém zvlášť a na krabičce u trati (Raspberry Pi) by stejně nebylo
-# komu se dívat. Místo toho má **vlastní stránku**. Na Pi se otevře na jeho
-# displeji, na notebooku na `localhost` — a je to tatáž stránka, takže se
-# nastavení dělá na obou místech stejně.
+# každý systém zvlášť. Místo toho má **vlastní stránku**. Na krabičce u trati
+# běží přes celou obrazovku a je to její displej; z notebooku se otevře přes
+# síť. Nastavení (adresa aplikace) je pod ní na `/nastaveni`, aby se na hlavní
+# obrazovce nedalo omylem nic přepsat.
 #
-# Bez závislostí: `http.server` je ve standardní knihovně.
+# Bez závislostí: `http.server` je ve standardní knihovně, styl je vlastní.
 
 WEB_PORT = 8088
 
-_PAGE = """<!doctype html>
+_STYLE = """
+ :root {{ color-scheme: dark; }}
+ * {{ box-sizing: border-box; }}
+ html, body {{ margin:0; height:100%; background:#050505; overflow:hidden;
+               font-family: system-ui, Arial, Helvetica, sans-serif; color:#fff; }}
+ main {{ height:100%; display:flex; align-items:center; justify-content:center; padding:12px;
+         background: radial-gradient(circle at 50% 30%, rgba(38,38,38,.28), transparent 45%),
+                     linear-gradient(180deg, #090b0c 0%, #050607 100%); }}
+ .ramecek {{ width:100%; height:100%; max-width:900px; max-height:520px; border-radius:28px;
+             border:1px solid rgba(63,63,70,.6); background:rgba(0,0,0,.8); padding:16px;
+             box-shadow:0 25px 50px -12px rgba(0,0,0,.6); }}
+ .vnitrek {{ height:100%; border-radius:20px; border:1px solid #27272a; background:rgba(0,0,0,.4);
+             padding:16px 24px; display:flex; flex-direction:column; }}
+ header {{ text-align:center; border-bottom:1px solid #27272a; padding-bottom:14px; }}
+ h1 {{ margin:0; font-weight:900; letter-spacing:.14em; line-height:1;
+       font-size:clamp(2rem, 7vw, 4.6rem); }}
+ h1 .tecka {{ color:#ef4444; }}
+ .stav {{ flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
+          border-bottom:1px solid #27272a; padding:14px 0; }}
+ .popisek {{ text-transform:uppercase; letter-spacing:.08em; color:#e4e4e7; font-weight:600;
+             font-size:clamp(1rem, 2.5vw, 1.8rem); margin:0; }}
+ .vysledek {{ margin-top:12px; display:flex; align-items:center; gap:20px; }}
+ .kolecko {{ width:clamp(5rem,9vw,7rem); height:clamp(5rem,9vw,7rem); border-radius:50%;
+             border:5px solid {barva}; display:flex; align-items:center; justify-content:center;
+             color:{barva}; font-size:clamp(2.5rem,6vw,4rem); font-weight:900;
+             text-shadow:0 0 10px {zare}; }}
+ .slovo {{ color:{barva}; font-weight:900; line-height:1; text-shadow:0 0 10px {zare};
+           font-size:clamp(2.5rem, 8vw, 7rem); }}
+ .detail {{ margin:10px 0 0; color:#a1a1aa; font-size:clamp(.8rem,1.8vw,1.05rem); text-align:center; }}
+ .tokenblok {{ padding-top:14px; }}
+ .tokenramecek {{ margin-top:10px; border-radius:16px; border:2px solid rgba(132,204,22,.8);
+                  padding:14px 18px; text-align:center;
+                  background-image: radial-gradient(rgba(87,255,36,.16) 1px, transparent 1px);
+                  background-size:7px 7px; }}
+ code {{ display:block; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-weight:700;
+         letter-spacing:.09em; color:#84cc16; text-shadow:0 0 8px rgba(80,255,30,.25);
+         font-size:clamp(1rem, 3vw, 2.2rem); word-break:break-all; }}
+ .paticka {{ margin-top:14px; display:flex; align-items:center; justify-content:center; gap:8px;
+             color:#a1a1aa; font-size:clamp(.7rem,1.7vw,1rem); }}
+ .paticka a {{ color:#a1a1aa; }}
+"""
+
+_SCREEN = """<!doctype html>
 <html lang="cs"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agent u trati</title>
+<title>{nadpis}</title>
+<style>{styl}</style>
+<meta http-equiv="refresh" content="5">
+</head>
+<body><main><section class="ramecek"><div class="vnitrek">
+ <header><h1>BIKODY<span class="tecka">.</span>COM</h1></header>
+
+ <section class="stav">
+  <p class="popisek">Stav serveru:</p>
+  <div class="vysledek">
+   <div class="kolecko">{znak}</div>
+   <div class="slovo">{slovo}</div>
+  </div>
+  <p class="detail">{detail}</p>
+ </section>
+
+ <section class="tokenblok">
+  <p class="popisek" style="text-align:center">{token_popisek}</p>
+  <div class="tokenramecek"><code>{token}</code></div>
+  <p class="paticka">AKTUALIZOVÁNO: {cas} · <a href="/nastaveni">nastavení</a></p>
+ </section>
+</div></section></main></body></html>"""
+
+_SETTINGS = """<!doctype html>
+<html lang="cs"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nastavení — agent u trati</title>
 <style>
  :root {{ color-scheme: dark; font-family: system-ui, sans-serif; }}
  body {{ margin:0; background:#0b0f14; color:#e6edf3; display:flex; justify-content:center; }}
- main {{ width:min(560px, 92vw); padding:24px 0 40px; }}
+ main {{ width:min(560px,92vw); padding:24px 0 40px; }}
  h1 {{ font-size:20px; margin:24px 0 4px; }}
- .stav {{ display:flex; align-items:center; gap:10px; background:#111820; border:1px solid #1e2a36;
-          border-radius:12px; padding:14px 16px; margin:16px 0; }}
- .tecka {{ width:10px; height:10px; border-radius:50%; background:{muted}; flex:none; }}
- .tecka.ok {{ background:#3fb950; }}
  label {{ display:block; font-size:12px; text-transform:uppercase; letter-spacing:.08em;
           color:#8b98a5; margin:16px 0 6px; }}
- input[type=text] {{ width:100%; box-sizing:border-box; height:40px; padding:0 12px; border-radius:10px;
+ input[type=text] {{ width:100%; height:40px; padding:0 12px; border-radius:10px; box-sizing:border-box;
          border:1px solid #1e2a36; background:#0d141b; color:#e6edf3; font-size:15px; }}
  .radek {{ display:flex; align-items:center; gap:8px; margin-top:16px; font-size:14px; color:#c9d5e1; }}
+ button {{ margin-top:20px; height:40px; padding:0 20px; border-radius:10px; border:0;
+           background:#2f81f7; color:#fff; font-weight:600; font-size:15px; cursor:pointer; }}
+ p.hint {{ color:#8b98a5; font-size:12px; line-height:1.5; }}
+ code {{ background:#0d141b; padding:2px 5px; border-radius:5px; font-size:12px; }}
  table {{ width:100%; border-collapse:collapse; margin-top:24px; font-size:13px; }}
  th {{ text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.08em;
        color:#8b98a5; font-weight:600; padding:0 0 6px; }}
  td {{ padding:6px 0; border-top:1px solid #1e2a36; color:#c9d5e1; }}
  td.stavbunka {{ color:#3fb950; }} td.stavbunka.chyba {{ color:#f85149; }}
- button {{ margin-top:20px; height:40px; padding:0 20px; border-radius:10px; border:0;
-           background:#2f81f7; color:#fff; font-weight:600; font-size:15px; cursor:pointer; }}
- p.hint {{ color:#8b98a5; font-size:12px; line-height:1.5; }}
- code {{ background:#0d141b; padding:2px 5px; border-radius:5px; font-size:12px; }}
+ a {{ color:#2f81f7; }}
 </style></head>
 <body><main>
- <h1>Agent u trati</h1>
- <p class="hint">Přeposílá dotazy aplikace na dekodéry a cílovou kameru v téhle síti.</p>
- <div class="stav"><span class="tecka{ok}"></span><span>{status}</span></div>
+ <h1>Agent u trati — nastavení</h1>
+ <p class="hint">{stav}</p>
  <form method="post">
   <label for="server">Adresa aplikace</label>
   <input type="text" id="server" name="server" value="{server}" placeholder="https://vas-server.cz">
-  <label for="code">Párovací kód z aplikace</label>
-  <input type="text" id="code" name="code" value="" placeholder="ABCD-2345" autocapitalize="characters">
-  <p class="hint">V aplikaci: Nastavení dekodérů → <strong>Spárovat krabičku</strong>.
-    Kód platí půl hodiny a použije se jednou.</p>
-  <details><summary class="hint" style="cursor:pointer">Radši vložit celý token</summary>
-   <input type="text" id="token" name="token" value="" placeholder="{token_hint}" style="margin-top:8px">
-  </details>
   <div class="radek">
    <input type="checkbox" id="autostart" name="autostart" {autostart}>
-   <label for="autostart" style="margin:0; text-transform:none; letter-spacing:0; font-size:14px;">
+   <label for="autostart" style="margin:0;text-transform:none;letter-spacing:0;font-size:14px">
      Spouštět po startu počítače</label>
   </div>
-  <button type="submit">Uložit a připojit</button>
+  <div class="radek">
+   <input type="checkbox" id="novytoken" name="novytoken">
+   <label for="novytoken" style="margin:0;text-transform:none;letter-spacing:0;font-size:14px">
+     Vyrobit nový token (starý přestane platit)</label>
+  </div>
+  <button type="submit">Uložit</button>
  </form>
- {recent}
- <p class="hint">Token se ukládá do <code>{config}</code> a na stránce se už nezobrazuje —
-   nový se vydává v aplikaci, v Nastavení dekodérů.</p>
-</main>
-<script>setTimeout(function () {{ location.reload(); }}, 5000);</script>
-</body></html>"""
+ <p class="hint">Token krabičky: <code>{token}</code><br>
+   Opište ho v aplikaci do <strong>Nastavení dekodérů → Token krabičky</strong>.
+   Uložený je v <code>{config}</code>.</p>
+ {spojeni}
+ <p class="hint"><a href="/">zpět na displej</a></p>
+</main></body></html>"""
 
 
 def _recent_table() -> str:
-    """Poslední spojení na dekodéry a kameru — co je na displeji vidět."""
+    """Poslední spojení na dekodéry a kameru — co je vidět v nastavení."""
     if not _recent:
         return ""
     rows = "".join(
@@ -525,59 +642,73 @@ def _recent_table() -> str:
         )
         for entry in _recent
     )
-    return (
-        "<table><tr><th>Kdy</th><th>Kam</th><th>Výsledek</th></tr>" + rows + "</table>"
-    )
+    return "<table><tr><th>Kdy</th><th>Kam</th><th>Výsledek</th></tr>" + rows + "</table>"
 
 
-def _render_page(worker, config: dict) -> bytes:
-    token = config.get("token") or ""
-    page = _PAGE.format(
-        muted="#6e7681",
-        ok=" ok" if (worker and worker.connected) else "",
-        status=(worker.status if worker else "nenastaveno — vyplňte adresu a párovací kód"),
-        server=(config.get("server") or ""),
-        token_hint=("uložený token: …" + token[-4:]) if token else "vložte token z aplikace",
-        autostart="checked" if config.get("autostart") else "",
-        config=config_path(),
-        recent=_recent_table(),
+def _screen_state(worker, config: dict) -> dict:
+    """Co má být na displeji: velký stav, a token jen dokud je k něčemu.
+
+    **Spárovaná krabička token neukazuje.** Do té doby je to jediné, proč se
+    na displej dívat; potom už je to jen klíč do klubové sítě vystavený celý
+    den na obrazovce u trati. Kdo ho potřebuje znovu, najde ho v nastavení.
+    """
+    connected = bool(worker and worker.connected)
+    token = (config.get("token") or "").strip()
+
+    if connected:
+        return {
+            "barva": "#84cc16", "zare": "rgba(80,255,30,.35)",
+            "znak": "✓", "slovo": "OK",
+            "detail": worker.status if worker else "",
+            "token_popisek": "Token krabičky:",
+            "token": token[: TOKEN_GROUP_LEN] + "-…-" + token[-TOKEN_GROUP_LEN:] if token else "—",
+        }
+    if not (config.get("server") or "").strip():
+        return {
+            "barva": "#eab308", "zare": "rgba(234,179,8,.35)",
+            "znak": "!", "slovo": "NASTAVIT",
+            "detail": "Doplňte adresu aplikace v nastavení této krabičky.",
+            "token_popisek": "Token krabičky:", "token": token or "—",
+        }
+    return {
+        "barva": "#eab308", "zare": "rgba(234,179,8,.35)",
+        "znak": "…", "slovo": "ČEKÁ",
+        "detail": (worker.status if worker else "čeká na schválení v aplikaci"),
+        "token_popisek": "Opište token do aplikace:",
+        "token": token or "—",
+    }
+
+
+def _render_screen(worker, config: dict) -> bytes:
+    state = _screen_state(worker, config)
+    style = _STYLE.format(barva=state["barva"], zare=state["zare"])
+    page = _SCREEN.format(
+        nadpis="BIKODY.COM — krabička u trati",
+        styl=style,
+        znak=state["znak"],
+        slovo=state["slovo"],
+        detail=state["detail"],
+        token_popisek=state["token_popisek"],
+        token=state["token"],
+        cas=time.strftime("%d.%m.%Y %H:%M:%S"),
     )
     return page.encode("utf-8")
 
 
-def redeem_pair_code(server_url: str, code: str) -> str:
-    """Vymění párovací kód za token. Vrací token, nebo vyhodí `ValueError`.
-
-    Krabička u trati má dotykový displej: osm znaků se na něm napíše, token
-    o třiačtyřiceti ne.
-    """
-    request = urllib.request.Request(
-        f"{server_url.rstrip('/')}/bmx/api/agent/pair/",
-        data=json.dumps({"code": code}).encode("utf-8"),
-        method="POST",
+def _render_settings(worker, config: dict) -> bytes:
+    page = _SETTINGS.format(
+        stav=(worker.status if worker else "nespuštěno — doplňte adresu aplikace"),
+        server=(config.get("server") or ""),
+        autostart="checked" if config.get("autostart") else "",
+        token=(config.get("token") or "—"),
+        config=config_path(),
+        spojeni=_recent_table(),
     )
-    request.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            answer = json.loads(response.read() or b"{}")
-    except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = json.loads(exc.read() or b"{}").get("error", "")
-        except (ValueError, OSError):
-            pass
-        raise ValueError(detail or f"Server odpověděl {exc.code}.") from exc
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise ValueError(f"Server není k dispozici ({exc}).") from exc
-
-    token = answer.get("token") or ""
-    if not token:
-        raise ValueError("Server token neposlal.")
-    return token
+    return page.encode("utf-8")
 
 
 def build_web_server(state: dict, *, host: str, port: int):
-    """Stránka agenta. `state` drží běžícího workera, ať jde vyměnit za chodu."""
+    """Displej a nastavení krabičky. `state` drží workera, ať jde vyměnit za chodu."""
     import http.server
     import urllib.parse
 
@@ -595,38 +726,22 @@ def build_web_server(state: dict, *, host: str, port: int):
             self.wfile.write(body)
 
         def do_GET(self):              # noqa: N802 — jméno určuje knihovna
-            page = _render_page(state.get("worker"), load_config())
-            problem = state.pop("chyba", "")
-            if problem:
-                # Chyba párování se ukáže jednou; při dalším načtení už by
-                # jen mátla, protože se mezitím mohlo povést.
-                page = page.replace(
-                    b'<form method="post">',
-                    ('<div class="stav"><span class="tecka"></span><span>'
-                     f'{problem}</span></div><form method="post">').encode("utf-8"),
-                    1,
-                )
-            self._send(page)
+            config = load_config()
+            if self.path.startswith("/nastaveni"):
+                self._send(_render_settings(state.get("worker"), config))
+                return
+            self._send(_render_screen(state.get("worker"), config))
 
         def do_POST(self):             # noqa: N802
             length = int(self.headers.get("Content-Length") or 0)
             form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
             saved = load_config()
             server_url = (form.get("server", [""])[0] or "").strip() or saved.get("server", "")
-            # Prázdné pole tokenu znamená „nech ten uložený" — na stránce se
-            # nezobrazuje, takže by ho jinak každé uložení smazalo.
-            token = (form.get("token", [""])[0] or "").strip() or saved.get("token", "")
             autostart = "autostart" in form
 
-            # Párovací kód má přednost: kdo ho zadal, chce nový token.
-            code = (form.get("code", [""])[0] or "").strip()
-            if code and server_url:
-                try:
-                    token = redeem_pair_code(server_url, code)
-                    log("Párování proběhlo, token uložen.")
-                except ValueError as exc:
-                    log(f"Párování selhalo: {exc}")
-                    state["chyba"] = str(exc)
+            # Nový token se vyrábí jen na výslovné přání: obsluha ho má
+            # opsaný v aplikaci a tichá výměna by krabičku odpojila.
+            token = generate_token() if "novytoken" in form else ensure_token(saved)
 
             save_config(server_url, token, autostart=autostart)
             set_autostart(autostart)
@@ -638,7 +753,7 @@ def build_web_server(state: dict, *, host: str, port: int):
                 worker = Worker(server_url, token)
                 worker.start()
                 state["worker"] = worker
-            self._send(b"", status=303, headers=[("Location", "/")])
+            self._send(b"", status=303, headers=[("Location", "/nastaveni")])
 
     return http.server.ThreadingHTTPServer((host, port), Handler)
 
@@ -646,7 +761,7 @@ def build_web_server(state: dict, *, host: str, port: int):
 def serve_web(state: dict, *, host: str, port: int) -> None:
     server = build_web_server(state, host=host, port=port)
     shown = host if host != "0.0.0.0" else "adresa-teto-krabicky"
-    log(f"Nastavení agenta: http://{shown}:{port}/")
+    log(f"Displej krabičky: http://{shown}:{port}/")
     server.serve_forever()
 
 
@@ -685,7 +800,10 @@ def main(argv: list[str] | None = None) -> int:
 
     saved = load_config()
     server_url = args.server or saved.get("server", "")
-    token = args.token or saved.get("token", "")
+    # Token si krabička vyrobí sama a ukáže ho na displeji; obsluha ho opíše
+    # v aplikaci do Nastavení dekodérů. Opačný směr by znamenal opisovat na
+    # dotykovém displeji, což nikdo nechce.
+    token = args.token or ensure_token(saved)
 
     log(f"Agent {VERSION} startuje")
 
@@ -712,7 +830,7 @@ def main(argv: list[str] | None = None) -> int:
         worker.start()
         state["worker"] = worker
     else:
-        log("Zatím není zadaný server ani token — otevřete stránku nastavení.")
+        log("Zatím není zadaná adresa aplikace — doplňte ji v nastavení krabičky.")
 
     try:
         serve_web(state, host=args.web_host, port=args.web_port)

@@ -41,6 +41,7 @@ GATEWAY=""
 DNS="1.1.1.1"
 WITH_KIOSK=1
 DRY_RUN=0
+KIOSK_REZIM="zadny"      # plocha | systemd | zadny — podle toho, co drží obrazovku
 
 usage() {
     sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -142,7 +143,6 @@ info "časové pásmo: $TIMEZONE"
 krok "Agent"
 spust install -d -m 755 "$INSTALL_DIR"
 spust install -m 755 "$ROOT/agent/track_agent.py" "$INSTALL_DIR/track_agent.py"
-spust install -m 755 "$ROOT/kiosk/start-kiosk.sh" "$INSTALL_DIR/start-kiosk.sh"
 spust install -m 644 "$ROOT/systemd/$AGENT_SERVICE.service" "/etc/systemd/system/$AGENT_SERVICE.service"
 
 # Adresa aplikace se zapíše rovnou, takže krabička po zapnutí ukáže token
@@ -177,21 +177,40 @@ info "služba $AGENT_SERVICE zapnuta"
 
 if [[ $WITH_KIOSK -eq 1 ]]; then
     krok "Displej (kiosk)"
-    spust install -m 644 "$ROOT/systemd/$KIOSK_SERVICE.service" \
-        "/etc/systemd/system/$KIOSK_SERVICE@.service"
-    spust systemctl daemon-reload
-    spust systemctl enable "$KIOSK_SERVICE@$DESKTOP_USER"
-    spust systemctl restart "$KIOSK_SERVICE@$DESKTOP_USER"
-    spust loginctl enable-linger "$DESKTOP_USER"
-    info "běží pod uživatelem $DESKTOP_USER, bez plochy a bez přihlašování"
-    # Pi OS s plochou drží tty1 sám a kiosk se s ním o obrazovku pere: displej
-    # bliká, jak ho systemd každé tři vteřiny zvedá znovu. Krabička má dělat
-    # jednu věc, takže plocha na ní nemá co dělat — ale vypnout ji někomu pod
-    # rukama je zásah, který si má odklepnout sám.
+    spust install -m 755 "$ROOT/kiosk/start-kiosk.sh" "$INSTALL_DIR/start-kiosk.sh"
+
+    # Dvě cesty, protože Raspberry Pi OS je dvojí. Rozhoduje to, jestli systém
+    # startuje do plochy: ta si obrazovku vezme sama a `cage` by se s ní pral —
+    # displej pak bliká, jak systemd každé tři vteřiny zvedá poraženého.
     if [[ "$(systemctl get-default 2>/dev/null)" == "graphical.target" ]]; then
-        varuj "Systém startuje do plochy a ta drží tty1 — displej bude blikat."
-        varuj "Krabička plochu nepotřebuje:"
+        KIOSK_REZIM="plocha"
+        info "systém startuje do plochy — kiosk poběží uvnitř ní"
+        # Ať po předchozím běhu nezůstane služba, která se o obrazovku pere.
+        if systemctl is-enabled --quiet "$KIOSK_SERVICE@$DESKTOP_USER" 2>/dev/null; then
+            spust systemctl disable --now "$KIOSK_SERVICE@$DESKTOP_USER"
+        fi
+        DESKTOP_HOME="$(getent passwd "$DESKTOP_USER" 2>/dev/null | cut -d: -f6 || true)"
+        DESKTOP_HOME="${DESKTOP_HOME:-/home/$DESKTOP_USER}"
+        spust install -d -m 755 -o "$DESKTOP_USER" -g "$DESKTOP_USER" \
+            "$DESKTOP_HOME/.config/autostart"
+        spust install -m 644 -o "$DESKTOP_USER" -g "$DESKTOP_USER" \
+            "$ROOT/kiosk/event-control-kiosk.desktop" \
+            "$DESKTOP_HOME/.config/autostart/event-control-kiosk.desktop"
+        info "spustí se s plochou uživatele $DESKTOP_USER (po odhlášení a přihlášení)"
+        varuj "Krabička plochu nepotřebuje. Bez ní naběhne displej sama po zapnutí:"
         varuj "    sudo systemctl set-default multi-user.target && sudo reboot"
+    else
+        KIOSK_REZIM="systemd"
+        spust install -m 644 "$ROOT/systemd/$KIOSK_SERVICE.service" \
+            "/etc/systemd/system/$KIOSK_SERVICE@.service"
+        spust systemctl daemon-reload
+        spust systemctl enable "$KIOSK_SERVICE@$DESKTOP_USER"
+        # Po smyčce restartů zůstane služba „failed" a systemd ji odmítne
+        # spustit, dokud se počítadlo nesmaže.
+        spust systemctl reset-failed "$KIOSK_SERVICE@$DESKTOP_USER" 2>/dev/null || true
+        spust systemctl restart "$KIOSK_SERVICE@$DESKTOP_USER"
+        spust loginctl enable-linger "$DESKTOP_USER"
+        info "běží pod uživatelem $DESKTOP_USER, bez plochy a bez přihlašování"
     fi
 else
     krok "Displej přeskočen (--no-kiosk)"
@@ -253,7 +272,7 @@ fi
 
 krok "Kontrola"
 SLUZBY=("$AGENT_SERVICE")
-[[ $WITH_KIOSK -eq 1 ]] && SLUZBY+=("$KIOSK_SERVICE@$DESKTOP_USER")
+[[ "$KIOSK_REZIM" == "systemd" ]] && SLUZBY+=("$KIOSK_SERVICE@$DESKTOP_USER")
 
 if [[ $DRY_RUN -eq 1 ]]; then
     info "nanečisto — služby se nespouštěly"

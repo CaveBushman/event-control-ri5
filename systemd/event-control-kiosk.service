@@ -14,6 +14,14 @@ After=event-control-agent.service systemd-user-sessions.service
 Wants=event-control-agent.service
 ConditionPathExists=/dev/tty1
 
+# tty1 může mít jen jeden. Bez tohohle řádku ho drží přihlašovací `getty`:
+# kiosk ho při startu odpojí (`TTYVHangup`), systemd getty hned zvedne, ten
+# udělá totéž a pošle **SIGHUP kiosku**. Ten umře, systemd ho za tři vteřiny
+# zvedne — a takhle pořád dokola. Na displeji je z toho blikání a v logu
+# „code=killed, signal=HUP" s rostoucím počítadlem restartů.
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+
 [Service]
 Type=simple
 User=%i

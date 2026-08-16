@@ -30,9 +30,15 @@ FLAGS=(
     --ozone-platform=wayland
 )
 
-# `cage` je minimální kompozitor: spustí prohlížeč na holé obrazovce bez
-# plochy, takže se po zapnutí nemusí nikdo přihlašovat. Když v systému není,
-# zkusí se prohlížeč přímo — to funguje uvnitř desktopové relace.
+# Uvnitř plochy se prohlížeč pouští **přímo**. `cage` je taky kompozitor
+# a dva kompozitory na jedné obrazovce se perou: displej bliká, jak systemd
+# každé tři vteřiny zvedá ten, který právě prohrál.
+if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
+    exec "$BROWSER" "${FLAGS[@]}" "$URL"
+fi
+
+# Bez plochy si obrazovku vezme `cage`: minimální kompozitor, který spustí
+# prohlížeč na holé obrazovce, takže se po zapnutí nemusí nikdo přihlašovat.
 if command -v cage >/dev/null; then
     exec cage -d -- "$BROWSER" "${FLAGS[@]}" "$URL"
 fi

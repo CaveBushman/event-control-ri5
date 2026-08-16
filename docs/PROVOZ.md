@@ -4,7 +4,8 @@ Krátký seznam pro obsluhu u trati. Podrobnosti jsou v `README.md`.
 
 ## Před závodem (večer nebo ráno)
 
-1. **Zapojit** — napájení, ethernet do stejného switche jako dekodéry.
+1. **Zapojit** — napájení, ethernet do stejného switche jako dekodéry. Nic
+   se nespouští, krabička najede sama.
 2. **Podívat se na displej.** Do minuty má svítit zelené **OK** a text
    *připojen jako … (organizace)*.
 3. **V aplikaci** otevřít *Nastavení dekodérů* — u agenta má být zelená tečka
@@ -36,7 +37,7 @@ průjezdy jsou v dekodérech i v aplikaci.
 | *server není k dispozici* | Krabička nemá internet. Zkontrolovat kabel a router. |
 | Kontrolky Hill/Finish jsou červené | Krabička nevidí dekodéry: jiná síť, vypnutý switch, nebo špatná IP v *Nastavení dekodérů*. |
 | Kamera červená | Software kamery neběží, nebo má jinou adresu než v *Nastavení aplikace*. |
-| Displej je černý | Krabička běží dál, jen zhasla obrazovka — dotknout se jí. Agent na displeji nezávisí. |
+| Displej je černý | Agent běží dál, časomíra jede. Displej se sám zvedne do tří vteřin; když ne, `sudo systemctl restart event-control-kiosk@$USER`. |
 
 Log krabičky (přes SSH):
 

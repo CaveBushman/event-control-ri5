@@ -29,21 +29,46 @@ install -m 644 "$ROOT/systemd/$SERVICE.service" "/etc/systemd/system/$SERVICE.se
 systemctl daemon-reload
 systemctl enable --now "$SERVICE"
 
-if [[ -d "$DESKTOP_HOME" ]]; then
-    echo "▶ Kiosk pro uživatele $DESKTOP_USER"
-    install -d -m 755 -o "$DESKTOP_USER" -g "$DESKTOP_USER" "$DESKTOP_HOME/.config/autostart"
-    install -m 644 -o "$DESKTOP_USER" -g "$DESKTOP_USER" \
-        "$ROOT/kiosk/event-control-kiosk.desktop" \
-        "$DESKTOP_HOME/.config/autostart/event-control-kiosk.desktop"
-    install -m 755 "$ROOT/kiosk/start-kiosk.sh" "$INSTALL_DIR/start-kiosk.sh"
+echo "▶ Displej (kiosk) pro uživatele $DESKTOP_USER"
+install -m 755 "$ROOT/kiosk/start-kiosk.sh" "$INSTALL_DIR/start-kiosk.sh"
 
-    if ! command -v chromium-browser >/dev/null && ! command -v chromium >/dev/null; then
-        echo "  chromium není nainstalovaný — doinstaluji"
-        apt-get update -qq && apt-get install -y -qq chromium-browser unclutter
-    fi
-else
-    echo "▶ Kiosk přeskočen (uživatel $DESKTOP_USER nemá domovskou složku)"
+MISSING=()
+command -v cage >/dev/null || MISSING+=(cage)
+command -v chromium-browser >/dev/null || command -v chromium >/dev/null || MISSING+=(chromium-browser)
+if [[ ${#MISSING[@]} -gt 0 ]]; then
+    echo "  doinstaluji: ${MISSING[*]}"
+    apt-get update -qq && apt-get install -y -qq "${MISSING[@]}"
 fi
+
+# Kiosk běží jako služba **konkrétního uživatele** (šablona `@`), aby měl
+# `cage` kde mít svůj runtime adresář. Přihlašovat se nikdo nemusí.
+install -m 644 "$ROOT/systemd/event-control-kiosk.service" \
+    "/etc/systemd/system/event-control-kiosk@.service"
+systemctl daemon-reload
+systemctl enable --now "event-control-kiosk@$DESKTOP_USER"
+
+# Aby se `cage` po odhlášení nezavřel a session přežila zavření terminálu.
+loginctl enable-linger "$DESKTOP_USER" 2>/dev/null || true
+
+# Konzole nemá zhasínat — pod kioskem není vidět, ale při pádu prohlížeče ano.
+if [[ -f /boot/firmware/cmdline.txt ]] && ! grep -q "consoleblank=0" /boot/firmware/cmdline.txt; then
+    sed -i '1 s/$/ consoleblank=0/' /boot/firmware/cmdline.txt
+    echo "  vypnuto zhasínání konzole (projeví se po restartu)"
+fi
+
+# Zamrzlou krabičku u trati nemá kdo rozebírat: hardwarový watchdog ji do
+# minuty restartuje sám.
+if [[ -f /boot/firmware/config.txt ]] && ! grep -q "^dtparam=watchdog=on" /boot/firmware/config.txt; then
+    echo "dtparam=watchdog=on" >> /boot/firmware/config.txt
+    echo "  zapnut hardwarový watchdog (projeví se po restartu)"
+fi
+install -d -m 755 /etc/systemd/system.conf.d
+cat > /etc/systemd/system.conf.d/event-control-watchdog.conf <<'WD'
+# Krabička u trati běží bez obsluhy: když zamrzne, restartuje se sama.
+[Manager]
+RuntimeWatchdogSec=30
+RebootWatchdogSec=2min
+WD
 
 IP="$(hostname -I | awk '{print $1}')"
 cat <<INFO

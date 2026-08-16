@@ -41,7 +41,7 @@ tentýž soubor. Krabička má ale tři věci navíc, které se u trati počíta
 | Aktivní chladič nebo krabička s ventilátorem | Pi 5 se u trati zahřeje |
 | Napájení 27 W USB-C | originální; poddimenzované zdroje dělají restarty |
 | microSD 32 GB (A2) nebo NVMe | SD stačí, zápisů je minimum |
-| Displej | oficiální 7" dotykový, nebo malý HDMI |
+| Displej | oficiální 7" dotykový, nebo malý HDMI (dotyk není potřeba — nic se na něm nepíše) |
 | Ethernet kabel | wifi funguje, ale u trati je drát spolehlivější |
 
 Displej je kvůli obsluze, ne kvůli funkci: krabička bez displeje dělá totéž
@@ -69,6 +69,29 @@ Token vyrábí krabička, ne aplikace: na dotykovém displeji se nic nepíše,
 opisuje se tam, kde je klávesnice. **Přihlášená krabička token schová** —
 zůstane z něj jen začátek a konec, protože klíč do klubové sítě nemá viset
 celý den na obrazovce u trati. Celý je v jejím nastavení.
+
+## Co se stane po zapnutí zdroje
+
+Nic se nespouští ručně a nikdo se nikam nepřihlašuje:
+
+1. Systemd nastartuje **agenta** (`event-control-agent`) — hlásí se aplikaci
+   a přeposílá data. Běží jako systémová služba, takže na ploše nezávisí.
+2. Systemd nastartuje **displej** (`event-control-kiosk@<uživatel>`) — přes
+   `cage` (minimální Wayland kompozitor) pustí prohlížeč na holé obrazovce.
+   Proto se nemusí zapínat automatické přihlášení ani instalovat plocha.
+3. Displej počká, až se agent ozve, a teprve pak otevře jeho stránku. Chybová
+   stránka prohlížeče totiž vypadá jako rozbitá krabička.
+4. Když prohlížeč spadne, systemd ho do tří vteřin zvedne. Když zamrzne celé
+   Pi, restartuje ho **hardwarový watchdog** do půl minuty.
+
+Obojí se dá zkontrolovat:
+
+```bash
+systemctl status event-control-agent
+systemctl status event-control-kiosk@$USER
+```
+
+Agent na displeji nezávisí: i s černou obrazovkou jede časomíra dál.
 
 ## Co je na displeji
 

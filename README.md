@@ -122,6 +122,10 @@ Tři stavy, které displej ukazuje:
 * V aplikaci v **Nastavení dekodérů** je u agenta zelená tečka a jméno stroje.
 * V horní liště aplikace svítí kontrolky **Hill**, **Finish** a **Kamera**.
 * Tlačítko **Dohledat MAC adresy** projde i z produkce.
+* **Průjezdy naskakují do Parsingu** — to je ta hlavní věc, kvůli které
+  krabička je. Odběr se ptá dekodérů po sekundě a půl na to, co ještě
+  nedorazilo. Když se nic neobjevuje, bývá to dnem závodu: dekodér drží pamět
+  i z předchozích závodů a aplikace průjezdy z jiného dne zahazuje.
 
 Když krabička neběží, aplikace se chová jako dřív a spojení zkouší navázat
 sama — u trati to nefunguje, ale nic se nerozbije.

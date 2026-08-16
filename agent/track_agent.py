@@ -483,6 +483,12 @@ def set_autostart(enabled: bool) -> pathlib.Path | None:
 
 TOKEN_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 TOKEN_GROUPS = 6
+
+#: Tlačítko „Nový token" na displeji jistí dvě klepnutí: nový token odpojí
+#: spárovanou krabičku, takže ho nesmí vydat náhodný dotek. První klepnutí
+#: odjistí, druhé musí přijít do téhle lhůty.
+NOVY_TOKEN_POTVRZENI_S = 15.0
+_novy_token_pozadan = 0.0
 TOKEN_GROUP_LEN = 4
 
 
@@ -568,6 +574,11 @@ _STYLE = """
  .paticka {{ margin-top:14px; display:flex; align-items:center; justify-content:center; gap:8px;
              color:#a1a1aa; font-size:clamp(.7rem,1.7vw,1rem); }}
  .paticka a {{ color:#a1a1aa; }}
+ .novytoken {{ margin:10px 0 0; text-align:center; }}
+ .tlacitko {{ border:1px solid #3f3f46; background:#18181b; color:#a1a1aa; border-radius:12px;
+              padding:10px 22px; font-family:inherit; font-weight:700; letter-spacing:.08em;
+              text-transform:uppercase; font-size:clamp(.8rem,1.8vw,1.05rem); }}
+ .tlacitko.pozor {{ border-color:#ef4444; color:#fca5a5; background:rgba(239,68,68,.12); }}
 
  /* Malé SPI displeje (MHS35: 480×320). Spodní mez clamp() je stavěná na
     monitor — tady by token, kvůli kterému displej existuje, skončil pod
@@ -588,6 +599,8 @@ _STYLE = """
    .tokenramecek {{ margin-top:4px; padding:6px 8px; border-radius:10px; }}
    code {{ font-size:2.3rem; letter-spacing:.03em; }}
    .paticka {{ margin-top:5px; font-size:.58rem; }}
+   .novytoken {{ margin-top:4px; }}
+   .tlacitko {{ padding:6px 14px; border-radius:8px; font-size:.62rem; }}
  }}
 """
 
@@ -613,6 +626,7 @@ _SCREEN = """<!doctype html>
  <section class="tokenblok">
   <p class="popisek" style="text-align:center">{token_popisek}</p>
   <div class="tokenramecek"><code>{token}</code></div>
+  {tlacitko}
   <p class="paticka">AKTUALIZOVÁNO: {cas}</p>
  </section>
 </div></section></main></body></html>"""
@@ -734,6 +748,28 @@ def _token_html(token: str) -> str:
     return "-".join(groups[:half]) + "<br>" + "-".join(groups[half:])
 
 
+def _novy_token_odjisten() -> bool:
+    return (time.monotonic() - _novy_token_pozadan) <= NOVY_TOKEN_POTVRZENI_S
+
+
+def _tlacitko_html() -> str:
+    """Tlačítko „Nový token" — displej je dotykový, ale ruka u trati taky.
+
+    Odjištěný stav je červený a říká, co se stane; obrazovka se každých pět
+    sekund obnovuje, takže po uplynutí lhůty se tlačítko samo vrátí do klidu.
+    """
+    if _novy_token_odjisten():
+        return (
+            '<form method="post" action="/novy-token" class="novytoken">'
+            '<button type="submit" class="tlacitko pozor">'
+            "Klepněte znovu — starý token přestane platit</button></form>"
+        )
+    return (
+        '<form method="post" action="/novy-token" class="novytoken">'
+        '<button type="submit" class="tlacitko">Nový token</button></form>'
+    )
+
+
 def _render_screen(worker, config: dict) -> bytes:
     state = _screen_state(worker, config)
     style = _STYLE.format(barva=state["barva"], zare=state["zare"])
@@ -745,6 +781,7 @@ def _render_screen(worker, config: dict) -> bytes:
         detail=state["detail"],
         token_popisek=state["token_popisek"],
         token=_token_html(state["token"]),
+        tlacitko=_tlacitko_html(),
         cas=time.strftime("%d.%m.%Y %H:%M:%S"),
     )
     return page.encode("utf-8")
@@ -804,6 +841,29 @@ def build_web_server(state: dict, *, host: str, port: int):
             length = int(self.headers.get("Content-Length") or 0)
             form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
             saved = load_config()
+
+            if self.path.startswith("/novy-token"):
+                global _novy_token_pozadan
+                if _novy_token_odjisten():
+                    # Druhé klepnutí ve lhůtě — teď doopravdy.
+                    _novy_token_pozadan = 0.0
+                    token = generate_token()
+                    save_config(
+                        configured_server(saved), token,
+                        autostart=bool(saved.get("autostart")),
+                    )
+                    log("Vydán nový token z displeje krabičky")
+                    worker = state.get("worker")
+                    if worker is not None:
+                        worker.stop()
+                        worker = Worker(configured_server(saved), token)
+                        worker.start()
+                        state["worker"] = worker
+                else:
+                    _novy_token_pozadan = time.monotonic()
+                self._send(b"", status=303, headers=[("Location", "/")])
+                return
+
             server_url = (form.get("server", [""])[0] or "").strip() or configured_server(saved)
             autostart = "autostart" in form
 

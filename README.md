@@ -185,8 +185,9 @@ TCP spojení kamkoliv v ní. Proto:
 
 * přihlášená krabička token na displeji nezobrazuje celý;
 * nastavení je v `/opt/event-control-agent/config.json` s právy `600`;
-* nový token se vyrábí jen na výslovné přání v nastavení krabičky (tichá
-  výměna by ji odpojila) a musí se pak znovu opsat v aplikaci;
+* nový token se vyrábí jen na výslovné přání — tlačítkem **Nový token** na
+  displeji (jištěné dvěma klepnutími) nebo v nastavení krabičky — a musí se
+  pak znovu opsat v aplikaci;
 * stránka krabičky je dostupná v celé místní síti (proto se na ni dostanete
   z notebooku) — nepatří tedy do veřejné wifi pro diváky.
 

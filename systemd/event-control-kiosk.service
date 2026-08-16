@@ -39,6 +39,9 @@ ExecStart=/opt/event-control-agent/start-kiosk.sh
 # jako rozbitá krabička.
 Restart=always
 RestartSec=3
+# Prohlížeč na SIGTERM občas neumírá; čekat na něj 90 s znamená, že restart
+# kiosku vypadá jako zamrzlá krabička.
+TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target

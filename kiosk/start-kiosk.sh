@@ -27,7 +27,6 @@ FLAGS=(
     --disable-session-crashed-bubble
     --disable-features=Translate
     --check-for-update-interval=31536000
-    --ozone-platform=wayland
 )
 
 # Uvnitř plochy se prohlížeč pouští **přímo**. `cage` je taky kompozitor
@@ -37,10 +36,18 @@ if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
     exec "$BROWSER" "${FLAGS[@]}" "$URL"
 fi
 
-# Bez plochy si obrazovku vezme `cage`: minimální kompozitor, který spustí
-# prohlížeč na holé obrazovce, takže se po zapnutí nemusí nikdo přihlašovat.
-if command -v cage >/dev/null; then
-    exec cage -d -- "$BROWSER" "${FLAGS[@]}" "$URL"
+# S GPU (KMS, /dev/dri) si obrazovku vezme `cage`: minimální kompozitor,
+# který spustí prohlížeč na holé obrazovce bez plochy a bez přihlašování.
+if [[ -d /dev/dri ]] && command -v cage >/dev/null; then
+    exec cage -d -- "$BROWSER" "${FLAGS[@]}" --ozone-platform=wayland "$URL"
+fi
+
+# Malé SPI displeje (MHS35 a spol.) KMS nemají — jen framebuffer /dev/fb0.
+# Wayland tam nemá GPU a cage nikdy nenaskočí („Found 0 GPUs"); na
+# framebuffer umí kreslit X server s ovladačem fbdev.
+if [[ -e /dev/fb0 ]] && command -v xinit >/dev/null; then
+    exec xinit /opt/event-control-agent/kiosk-x-session.sh "$BROWSER" "${FLAGS[@]}" "$URL" \
+        -- :0 vt1 -keeptty -nolisten tcp
 fi
 
 exec "$BROWSER" "${FLAGS[@]}" "$URL"

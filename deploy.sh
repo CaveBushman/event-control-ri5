@@ -113,8 +113,17 @@ CHYBI=()
 command -v curl >/dev/null || CHYBI+=(curl)
 command -v python3 >/dev/null || CHYBI+=(python3)
 if [[ $WITH_KIOSK -eq 1 ]]; then
-    command -v cage >/dev/null || CHYBI+=(cage)
     command -v chromium-browser >/dev/null || command -v chromium >/dev/null || CHYBI+=(chromium-browser)
+    # Podle grafiky: s KMS (/dev/dri) kreslí `cage`. Malé SPI displeje
+    # (MHS35 a spol.) mají jen framebuffer — tam Wayland nemá GPU a je
+    # potřeba X server s ovladačem fbdev.
+    if [[ -d /dev/dri ]]; then
+        command -v cage >/dev/null || CHYBI+=(cage)
+    elif [[ -e /dev/fb0 ]]; then
+        command -v xinit >/dev/null || CHYBI+=(xinit xserver-xorg xserver-xorg-video-fbdev xserver-xorg-legacy)
+    else
+        command -v cage >/dev/null || CHYBI+=(cage)
+    fi
 fi
 command -v avahi-daemon >/dev/null || CHYBI+=(avahi-daemon)
 
@@ -178,6 +187,20 @@ info "služba $AGENT_SERVICE zapnuta"
 if [[ $WITH_KIOSK -eq 1 ]]; then
     krok "Displej (kiosk)"
     spust install -m 755 "$ROOT/kiosk/start-kiosk.sh" "$INSTALL_DIR/start-kiosk.sh"
+    spust install -m 755 "$ROOT/kiosk/kiosk-x-session.sh" "$INSTALL_DIR/kiosk-x-session.sh"
+
+    if [[ ! -d /dev/dri && -e /dev/fb0 ]]; then
+        info "SPI displej bez KMS — kiosk pojede přes X na /dev/fb0"
+        spust install -d -m 755 /etc/X11/xorg.conf.d
+        spust install -m 644 "$ROOT/kiosk/99-event-control-fbdev.conf" \
+            /etc/X11/xorg.conf.d/99-event-control-fbdev.conf
+        # X spouští služba, ne přihlášený člověk u konzole — bez tohohle by
+        # wrapper start odmítl („Only console users are allowed").
+        zapis /etc/X11/Xwrapper.config \
+"allowed_users=anybody
+needs_root_rights=yes
+"
+    fi
 
     # Dvě cesty, protože Raspberry Pi OS je dvojí. Rozhoduje to, jestli systém
     # startuje do plochy: ta si obrazovku vezme sama a `cage` by se s ní pral —

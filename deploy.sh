@@ -8,16 +8,18 @@
 #   3. nakopíruje agenta do /opt a zapne ho jako službu,
 #   4. zapne displej (kiosk) jako službu — bez plochy a bez přihlašování,
 #   5. zapne hardwarový watchdog a vypne zhasínání konzole,
-#   6. volitelně předvyplní adresu aplikace a pevnou IP,
+#   6. volitelně nastaví pevnou IP,
 #   7. na konci zkontroluje, že obojí běží, a napíše, co zbývá.
 #
 # Použití:
 #
-#   sudo ./deploy.sh
-#   sudo ./deploy.sh --server https://vas-server.cz
-#   sudo ./deploy.sh --server https://vas-server.cz --hostname krabicka-brno \
-#                    --static-ip 192.168.9.10/24 --gateway 192.168.9.1
-#   ./deploy.sh --dry-run          # jen vypíše, co by udělal
+#   sudo bash deploy.sh
+#   sudo bash deploy.sh --hostname krabicka-brno \
+#                       --static-ip 192.168.9.10/24 --gateway 192.168.9.1
+#   bash deploy.sh --dry-run       # jen vypíše, co by udělal
+#
+# Přes `bash`, ne `./deploy.sh`: kopírování na Pi umí souboru sebrat právo
+# ke spuštění a `sudo ./deploy.sh` pak hlásí „command not found".
 #
 # Skript se dá pouštět opakovaně — je to nastavení, ne instalace. Token
 # krabičky se **nikdy nepřepisuje**: obsluha ho má opsaný v aplikaci.
@@ -29,7 +31,9 @@ AGENT_SERVICE=event-control-agent
 KIOSK_SERVICE=event-control-kiosk
 TIMEZONE_DEFAULT="Europe/Prague"
 
-SERVER=""
+# Aplikace běží na jednom místě, takže se adresa nikde nevypisuje. `--server`
+# zůstává kvůli zkouškám a vlastnímu serveru.
+SERVER="https://bikody.com"
 HOSTNAME_NEW=""
 TIMEZONE="$TIMEZONE_DEFAULT"
 STATIC_IP=""
@@ -141,9 +145,9 @@ spust install -m 755 "$ROOT/agent/track_agent.py" "$INSTALL_DIR/track_agent.py"
 spust install -m 755 "$ROOT/kiosk/start-kiosk.sh" "$INSTALL_DIR/start-kiosk.sh"
 spust install -m 644 "$ROOT/systemd/$AGENT_SERVICE.service" "/etc/systemd/system/$AGENT_SERVICE.service"
 
-# Adresa aplikace se dá předvyplnit, aby krabička po zapnutí rovnou ukázala
-# token a nemuselo se na ní nic nastavovat. Token se nikdy nepřepisuje —
-# obsluha ho má opsaný v aplikaci a tichá výměna by krabičku odpojila.
+# Adresa aplikace se zapíše rovnou, takže krabička po zapnutí ukáže token
+# a nemusí se na ní nic nastavovat. Token se nikdy nepřepisuje — obsluha ho
+# má opsaný v aplikaci a tichá výměna by krabičku odpojila.
 if [[ -n "$SERVER" ]]; then
     if [[ -f "$INSTALL_DIR/config.json" ]]; then
         info "adresa aplikace: $SERVER (token zůstává)"
@@ -162,7 +166,11 @@ PY
 fi
 
 spust systemctl daemon-reload
-spust systemctl enable --now "$AGENT_SERVICE"
+spust systemctl enable "$AGENT_SERVICE"
+# Restart, ne `enable --now`: běžící službu by `--now` nechal být a nová
+# verze agenta by se načetla až po ručním restartu — přitom právě proto se
+# skript pouští podruhé.
+spust systemctl restart "$AGENT_SERVICE"
 info "služba $AGENT_SERVICE zapnuta"
 
 # --- 4. displej ------------------------------------------------------------
@@ -172,9 +180,19 @@ if [[ $WITH_KIOSK -eq 1 ]]; then
     spust install -m 644 "$ROOT/systemd/$KIOSK_SERVICE.service" \
         "/etc/systemd/system/$KIOSK_SERVICE@.service"
     spust systemctl daemon-reload
-    spust systemctl enable --now "$KIOSK_SERVICE@$DESKTOP_USER"
+    spust systemctl enable "$KIOSK_SERVICE@$DESKTOP_USER"
+    spust systemctl restart "$KIOSK_SERVICE@$DESKTOP_USER"
     spust loginctl enable-linger "$DESKTOP_USER"
     info "běží pod uživatelem $DESKTOP_USER, bez plochy a bez přihlašování"
+    # Pi OS s plochou drží tty1 sám a kiosk se s ním o obrazovku pere: displej
+    # bliká, jak ho systemd každé tři vteřiny zvedá znovu. Krabička má dělat
+    # jednu věc, takže plocha na ní nemá co dělat — ale vypnout ji někomu pod
+    # rukama je zásah, který si má odklepnout sám.
+    if [[ "$(systemctl get-default 2>/dev/null)" == "graphical.target" ]]; then
+        varuj "Systém startuje do plochy a ta drží tty1 — displej bude blikat."
+        varuj "Krabička plochu nepotřebuje:"
+        varuj "    sudo systemctl set-default multi-user.target && sudo reboot"
+    fi
 else
     krok "Displej přeskočen (--no-kiosk)"
 fi
@@ -225,7 +243,10 @@ if [[ -n "$STATIC_IP" ]]; then
         echo "K --static-ip patří i --gateway." >&2
         exit 1
     fi
-    spust "$ROOT/scripts/set-static-ip.sh" "$STATIC_IP" "$GATEWAY" "$DNS"
+    # Přes `bash`, ne přímo: kopírování na Pi (scp, rozbalený archiv, klon
+    # s vypnutým core.fileMode) umí sebrat právo ke spuštění a skript by
+    # spadl na „Permission denied" až tady, uprostřed nastavování.
+    spust bash "$ROOT/scripts/set-static-ip.sh" "$STATIC_IP" "$GATEWAY" "$DNS"
 fi
 
 # --- 7. kontrola -----------------------------------------------------------
@@ -246,8 +267,12 @@ else
     done
 fi
 
-IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+# `|| true`, protože `hostname -I` zná Linux, ale ne každý systém — a se
+# zapnutým `pipefail` by na tom celý skript skončil těsně před tím, co má
+# obsluha přečíst.
+IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 NAZEV="$(hostname)"
+NAZEV="${NAZEV%.local}"      # mDNS jméno se skládá níž, ať tam není dvakrát
 cat <<INFO
 
 Hotovo.
@@ -255,16 +280,11 @@ Hotovo.
   Displej krabičky:  http://${IP:-<ip-krabicky>}:8088/   (nebo http://$NAZEV.local:8088/)
   Nastavení:         http://${IP:-<ip-krabicky>}:8088/nastaveni
 
-Po zapnutí zdroje najede agent i displej samy, bez přihlašování.
+Po zapnutí zdroje najede agent i displej samy, bez přihlašování. Hlásí se na
+$SERVER, takže zbývá jediný krok:
 
-Zbývá:
+  token z displeje opsat v aplikaci: Nastavení aplikace → Přihlásit krabičku.
 INFO
-if [[ -z "$SERVER" ]]; then
-    echo "  1) v nastavení krabičky vyplnit adresu aplikace,"
-    echo "  2) token z displeje opsat v aplikaci: Nastavení aplikace → Přihlásit krabičku."
-else
-    echo "  1) token z displeje opsat v aplikaci: Nastavení aplikace → Přihlásit krabičku."
-fi
 echo
 for SLUZBA in "${SLUZBY[@]}"; do
     echo "  stav:  systemctl status $SLUZBA"

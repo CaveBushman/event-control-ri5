@@ -10,10 +10,13 @@ Ven jde jen odchozí HTTPS, takže se na routeru pořadatele nic neotevírá.
 
 Spuštění:
 
-    python3 tools/track_agent.py --server https://vas-server.cz --token <token>
+    python3 tools/track_agent.py
 
-Token vydá aplikace v Nastavení aplikace → Přihlásit krabičku. Dá se místo
-přepínačů vzít i z prostředí (`EVENT_CONTROL_SERVER`, `EVENT_CONTROL_AGENT_TOKEN`).
+Adresa aplikace je předvyplněná (`DEFAULT_SERVER`) a token si program vyrobí
+sám — ukáže ho na své stránce a obsluha ho opíše v aplikaci do Nastavení
+aplikace → Přihlásit krabičku. Vlastní server a hotový token se dají předat
+přepínači `--server` / `--token` nebo prostředím (`EVENT_CONTROL_SERVER`,
+`EVENT_CONTROL_AGENT_TOKEN`).
 
 Program je schválně **jen ze standardní knihovny**: na notebooku u trati se
 nemá co instalovat a nemá co se rozbít. Neví nic o P3 ani o formátu startovky
@@ -35,6 +38,12 @@ import urllib.error
 import urllib.request
 
 VERSION = "1.0"
+
+#: Kam se agent hlásí, když mu nikdo neřekl jinak. Aplikace běží na jednom
+#: místě, takže adresu nemá co obsluha u trati vypisovat — krabička po zapnutí
+#: rovnou ukáže token a jediné, co zbývá, je opsat ho v aplikaci. Vlastní
+#: server se pořád dá zadat na stránce krabičky, přepínačem nebo prostředím.
+DEFAULT_SERVER = "https://bikody.com"
 
 #: Server drží dotaz otevřený, dokud nemá co poslat. Čtecí timeout musí být
 #: delší, jinak by agent spojení trhal těsně před odpovědí.
@@ -368,6 +377,16 @@ def load_config() -> dict:
         return {}
 
 
+def configured_server(config: dict) -> str:
+    """Adresa aplikace — z nastavení, jinak výchozí `DEFAULT_SERVER`.
+
+    Prázdný řetězec v souboru znamená „nikdo nic nezadal", ne „nikam se
+    nehlásit": krabička se staví pro jednu aplikaci a obsluha u trati nemá co
+    opisovat adresu. Kdo chce vlastní server, přepíše ji v nastavení.
+    """
+    return (config.get("server") or "").strip() or DEFAULT_SERVER
+
+
 def save_config(server_url: str, token: str, *, autostart: bool = False) -> None:
     """Uloží nastavení tak, aby ho nečetl kdokoli — token je heslo do sítě."""
     path = config_path()
@@ -607,7 +626,8 @@ _SETTINGS = """<!doctype html>
  <p class="hint">{stav}</p>
  <form method="post">
   <label for="server">Adresa aplikace</label>
-  <input type="text" id="server" name="server" value="{server}" placeholder="https://vas-server.cz">
+  <input type="text" id="server" name="server" value="{server}">
+  <p class="hint" style="margin:-8px 0 14px">Předvyplněno; měňte jen u vlastního serveru.</p>
   <div class="radek">
    <input type="checkbox" id="autostart" name="autostart" {autostart}>
    <label for="autostart" style="margin:0;text-transform:none;letter-spacing:0;font-size:14px">
@@ -663,11 +683,11 @@ def _screen_state(worker, config: dict) -> dict:
             "token_popisek": "Token krabičky:",
             "token": token[: TOKEN_GROUP_LEN] + "-…-" + token[-TOKEN_GROUP_LEN:] if token else "—",
         }
-    if not (config.get("server") or "").strip():
+    if not configured_server(config):
         return {
             "barva": "#eab308", "zare": "rgba(234,179,8,.35)",
             "znak": "!", "slovo": "NASTAVIT",
-            "detail": "Doplňte adresu aplikace v nastavení této krabičky.",
+            "detail": "V nastavení krabičky je smazaná adresa aplikace.",
             "token_popisek": "Token krabičky:", "token": token or "—",
         }
     return {
@@ -697,8 +717,8 @@ def _render_screen(worker, config: dict) -> bytes:
 
 def _render_settings(worker, config: dict) -> bytes:
     page = _SETTINGS.format(
-        stav=(worker.status if worker else "nespuštěno — doplňte adresu aplikace"),
-        server=(config.get("server") or ""),
+        stav=(worker.status if worker else "nespuštěno"),
+        server=configured_server(config),
         autostart="checked" if config.get("autostart") else "",
         token=(config.get("token") or "—"),
         config=config_path(),
@@ -736,7 +756,7 @@ def build_web_server(state: dict, *, host: str, port: int):
             length = int(self.headers.get("Content-Length") or 0)
             form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
             saved = load_config()
-            server_url = (form.get("server", [""])[0] or "").strip() or saved.get("server", "")
+            server_url = (form.get("server", [""])[0] or "").strip() or configured_server(saved)
             autostart = "autostart" in form
 
             # Nový token se vyrábí jen na výslovné přání: obsluha ho má
@@ -770,7 +790,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--server",
         default=os.environ.get("EVENT_CONTROL_SERVER", ""),
-        help="Adresa aplikace, např. https://vas-server.cz",
+        help=f"Adresa aplikace (výchozí {DEFAULT_SERVER})",
     )
     parser.add_argument(
         "--token",
@@ -799,7 +819,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     saved = load_config()
-    server_url = args.server or saved.get("server", "")
+    server_url = args.server or configured_server(saved)
     # Token si krabička vyrobí sama a ukáže ho na displeji; obsluha ho opíše
     # v aplikaci do Nastavení aplikace. Opačný směr by znamenal opisovat na
     # dotykovém displeji, což nikdo nechce.

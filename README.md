@@ -54,23 +54,30 @@ a stav se dá otevřít z notebooku v síti.
 2. Zkopírujte na Pi tenhle adresář (nebo `git clone`) a spusťte:
 
    ```bash
-   sudo ./deploy.sh --server https://vas-server.cz
+   sudo bash deploy.sh
    ```
 
    Jeden příkaz nastaví všechno: balíčky, agenta jako službu, displej,
-   watchdog i časové pásmo. Trvá to minutu a nic se neptá. Bez `--server` to
-   projde taky — adresa aplikace se pak vyplní na krabičce.
+   watchdog i časové pásmo. Trvá to minutu a nic se neptá. **Adresa aplikace
+   se nezadává** — krabička se hlásí na `bikody.com`. Vlastní server se dá
+   přidat přepínačem `--server`.
+
+   *Proč `bash` a ne `./deploy.sh`: kopírování na Pi umí sebrat souboru právo
+   ke spuštění (scp, rozbalený archiv, klon s vypnutým `core.fileMode`) a
+   `sudo ./deploy.sh` pak hlásí „command not found". Přes `bash` to jde vždy;
+   kdo chce, může si právo vrátit: `chmod +x deploy.sh`.*
 3. Na displeji se ukáže **token krabičky** — šest čtveřic znaků. Opište ho
-   v aplikaci do *Nastavení aplikace* → **Přihlásit krabičku**.
+   v aplikaci do *Nastavení aplikace* → **Přihlásit krabičku**. To je jediný
+   krok, který po instalaci zbývá.
 4. Do pěti vteřin naskočí na displeji velké zelené **OK**.
 
 Co skript umí navíc:
 
 ```bash
-sudo ./deploy.sh --hostname krabicka-brno \
-                 --static-ip 192.168.9.10/24 --gateway 192.168.9.1
-./deploy.sh --dry-run          # jen vypíše, co by udělal, a nic nezmění
-sudo ./deploy.sh --no-kiosk    # krabička bez displeje
+sudo bash deploy.sh --hostname krabicka-brno \
+                    --static-ip 192.168.9.10/24 --gateway 192.168.9.1
+bash deploy.sh --dry-run          # jen vypíše, co by udělal, a nic nezmění
+sudo bash deploy.sh --no-kiosk    # krabička bez displeje
 ```
 
 Pouštět se dá opakovaně — je to nastavení, ne instalace. **Token se přitom
@@ -120,7 +127,7 @@ Tři stavy, které displej ukazuje:
 
 | Stav | Co znamená |
 |---|---|
-| **NASTAVIT** (žlutá) | Chybí adresa aplikace — doplňte ji v nastavení krabičky. |
+| **NASTAVIT** (žlutá) | V nastavení krabičky je smazaná adresa aplikace. Běžně nenastane — adresa je předvyplněná. |
 | **ČEKÁ** (žlutá) | Token je vidět celý; opište ho v aplikaci. |
 | **OK** (zelená) | Krabička se hlásí aplikaci a přeposílá data. |
 
@@ -146,7 +153,7 @@ sama — u trati to nefunguje, ale nic se nerozbije.
 ```bash
 sudo systemctl status event-control-agent     # stav
 journalctl -u event-control-agent -f          # log
-sudo ./scripts/update.sh                      # nová verze agenta ze serveru
+sudo bash scripts/update.sh                   # nová verze agenta ze serveru
 sudo systemctl restart event-control-agent    # restart
 ```
 
@@ -164,7 +171,7 @@ spojení navazuje vždycky ona směrem ven. Nastaví se buď rezervací v DHCP n
 routeru (jednodušší), nebo na krabičce:
 
 ```bash
-sudo ./scripts/set-static-ip.sh 192.168.9.10/24 192.168.9.1
+sudo bash scripts/set-static-ip.sh 192.168.9.10/24 192.168.9.1
 ```
 
 **Adresy dekodérů a kamery se do krabičky nezadávají** — patří do aplikace

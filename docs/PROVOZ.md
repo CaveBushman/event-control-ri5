@@ -31,7 +31,7 @@ průjezdy jsou v dekodérech i v aplikaci.
 
 | Co je vidět | Co s tím |
 |---|---|
-| Displej ukazuje **NASTAVIT** | Chybí adresa aplikace — doplnit v nastavení krabičky. |
+| Displej ukazuje **NASTAVIT** | Někdo smazal adresu aplikace — doplnit v nastavení krabičky (`bikody.com`). |
 | Displej ukazuje **ČEKÁ** | Token z displeje ještě není v aplikaci — opsat ho do *Nastavení aplikace* → **Přihlásit krabičku**. |
 | **ČEKÁ** i po opsání | Překlep. Token se čte bez ohledu na pomlčky, mezery a malá písmena, ale znaky musí sedět. |
 | *server není k dispozici* | Krabička nemá internet. Zkontrolovat kabel a router. |

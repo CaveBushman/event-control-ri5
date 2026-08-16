@@ -66,7 +66,7 @@ a stav se dá otevřít z notebooku v síti.
    ke spuštění (scp, rozbalený archiv, klon s vypnutým `core.fileMode`) a
    `sudo ./deploy.sh` pak hlásí „command not found". Přes `bash` to jde vždy;
    kdo chce, může si právo vrátit: `chmod +x deploy.sh`.*
-3. Na displeji se ukáže **token krabičky** — šest čtveřic znaků. Opište ho
+3. Na displeji se ukáže **token krabičky** — čtyři čtveřice znaků. Opište ho
    v aplikaci do *Nastavení aplikace* → **Přihlásit krabičku**. To je jediný
    krok, který po instalaci zbývá.
 4. Do pěti vteřin naskočí na displeji velké zelené **OK**.

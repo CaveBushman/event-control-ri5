@@ -478,11 +478,11 @@ def set_autostart(enabled: bool) -> pathlib.Path | None:
 # tam, kde je klávesnice.
 #
 # Abeceda je bez znaků, které se na obrazovce pletou (0/O, 1/I/L), a token je
-# po čtveřicích: šest skupin = 120 bitů náhody, což na klíč do klubové sítě
-# stačí, a přitom se dá přečíst z metru.
+# po čtveřicích: čtyři skupiny = 80 bitů náhody, což na klíč do klubové sítě
+# stačí, a přitom se dá přečíst z metru — i z 3,5" displeje krabičky.
 
 TOKEN_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-TOKEN_GROUPS = 6
+TOKEN_GROUPS = 4
 TOKEN_GROUP_LEN = 4
 
 
@@ -564,10 +564,31 @@ _STYLE = """
                   background-size:7px 7px; }}
  code {{ display:block; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-weight:700;
          letter-spacing:.09em; color:#84cc16; text-shadow:0 0 8px rgba(80,255,30,.25);
-         font-size:clamp(1rem, 3vw, 2.2rem); word-break:break-all; }}
+         font-size:clamp(1.3rem, 4.2vw, 3rem); word-break:break-all; }}
  .paticka {{ margin-top:14px; display:flex; align-items:center; justify-content:center; gap:8px;
              color:#a1a1aa; font-size:clamp(.7rem,1.7vw,1rem); }}
  .paticka a {{ color:#a1a1aa; }}
+
+ /* Malé SPI displeje (MHS35: 480×320). Spodní mez clamp() je stavěná na
+    monitor — tady by token, kvůli kterému displej existuje, skončil pod
+    spodním okrajem. Nadpis a nadpisky ustoupí, token zůstává největší. */
+ @media (max-height: 420px) {{
+   main {{ padding:4px; }}
+   .ramecek {{ padding:5px; border-radius:14px; }}
+   .vnitrek {{ padding:4px 10px; border-radius:10px; }}
+   header {{ padding-bottom:4px; }}
+   h1 {{ font-size:1.15rem; letter-spacing:.1em; }}
+   .stav {{ padding:4px 0; }}
+   .popisek {{ font-size:.7rem; }}
+   .vysledek {{ margin-top:4px; gap:12px; }}
+   .kolecko {{ width:2.6rem; height:2.6rem; border-width:3px; font-size:1.3rem; }}
+   .slovo {{ font-size:2.1rem; }}
+   .detail {{ margin-top:4px; font-size:.62rem; }}
+   .tokenblok {{ padding-top:5px; }}
+   .tokenramecek {{ margin-top:4px; padding:6px 8px; border-radius:10px; }}
+   code {{ font-size:1.85rem; letter-spacing:.04em; }}
+   .paticka {{ margin-top:5px; font-size:.58rem; }}
+ }}
 """
 
 _SCREEN = """<!doctype html>

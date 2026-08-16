@@ -729,7 +729,7 @@ def _screen_state(worker, config: dict) -> dict:
         "barva": "#eab308", "zare": "rgba(234,179,8,.35)",
         "znak": "…", "slovo": "ČEKÁ",
         "detail": (worker.status if worker else "čeká na schválení v aplikaci"),
-        "token_popisek": "Opište token do aplikace:",
+        "token_popisek": "Opište token do aplikace — bez pomlček:",
         "token": token or "—",
     }
 

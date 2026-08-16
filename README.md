@@ -1,5 +1,7 @@
 # Event Control — krabička u trati
 
+*Ri5 = **R**aspberry P**i 5**. Není to překlep, neopravovat.*
+
 Raspberry Pi s displejem, které stojí u časomíry a **přeposílá data mezi
 aplikací a železem na trati**. Aplikace Event Control běží na serveru
 v datovém centru; dekodéry MyLaps a cílová kamera mají privátní adresy

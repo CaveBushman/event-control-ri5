@@ -38,6 +38,7 @@ průjezdy jsou v dekodérech i v aplikaci.
 | Kontrolky Hill/Finish jsou červené | Krabička nevidí dekodéry: jiná síť, vypnutý switch, nebo špatná IP v *Nastavení dekodérů*. |
 | Kamera červená | Software kamery neběží, nebo má jinou adresu než v *Nastavení aplikace*. |
 | Displej je černý | Agent běží dál, časomíra jede. Displej se sám zvedne do tří vteřin; když ne, `sudo systemctl restart event-control-kiosk@$USER`. |
+| Ventilátor jede naplno „bez důvodu" | Podívat se, kdo sype log: `journalctl --since '-1 min' \| wc -l`. Tisíce řádků za minutu = nějaká služba v havarijní smyčce (typicky Raspberry Pi Connect — `rpi-connect off`). |
 
 Log krabičky (přes SSH):
 

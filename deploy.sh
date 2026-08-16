@@ -270,6 +270,15 @@ RebootWatchdogSec=2min
 
 # Log na SD kartě neroste donekonečna — karta se u trati vytahuje ze zásuvky
 # a plný disk by krabičku položil dřív než cokoli jiného.
+# Raspberry Pi Connect na krabičce nemá co dělat — a bez přihlášení se točí
+# v havarijní smyčce („Sign in failed") stovkykrát za minutu: journald mele
+# naprázdno, CPU topí a ventilátor jede naplno, i když „nic neběží".
+if command -v rpi-connect >/dev/null; then
+    info "vypínám Raspberry Pi Connect (krabička ho nepoužívá)"
+    spust runuser -u "$DESKTOP_USER" -- env XDG_RUNTIME_DIR="/run/user/$(id -u "$DESKTOP_USER")" \
+        rpi-connect off || true
+fi
+
 spust install -d -m 755 /etc/systemd/journald.conf.d
 zapis /etc/systemd/journald.conf.d/event-control.conf \
 "[Journal]

@@ -128,7 +128,7 @@ Tři stavy, které displej ukazuje:
 | Stav | Co znamená |
 |---|---|
 | **NASTAVIT** (žlutá) | V nastavení krabičky je smazaná adresa aplikace. Běžně nenastane — adresa je předvyplněná. |
-| **ČEKÁ** (žlutá) | Token je vidět celý; opište ho v aplikaci. |
+| **ČEKÁ** (červená) | Token je vidět celý; opište ho v aplikaci. Červeně, aby se od OK lišilo přes půl závodiště. |
 | **OK** (zelená) | Krabička se hlásí aplikaci a přeposílá data. |
 
 ## Jak poznat, že to jede

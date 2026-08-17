@@ -725,8 +725,11 @@ def _screen_state(worker, config: dict) -> dict:
             "detail": "V nastavení krabičky je smazaná adresa aplikace.",
             "token_popisek": "Token krabičky:", "token": token or "—",
         }
+    # Červeně, ne žlutě: ČEKÁ znamená „ještě to nejede" a od zeleného OK se
+    # musí lišit na první pohled i přes půlku závodiště. Žlutá zůstává
+    # výjimečnému NASTAVIT.
     return {
-        "barva": "#eab308", "zare": "rgba(234,179,8,.35)",
+        "barva": "#ef4444", "zare": "rgba(239,68,68,.35)",
         "znak": "…", "slovo": "ČEKÁ",
         "detail": (worker.status if worker else "čeká na schválení v aplikaci"),
         "token_popisek": "Opište token do aplikace — bez pomlček:",

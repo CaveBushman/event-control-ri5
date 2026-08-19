@@ -363,6 +363,35 @@ STREAM_BACKLOG_MAX = 2000
 #: rozsypaný proud, ne data (stejná pojistka jako na serveru).
 STREAM_BUFFER_MAX = 256 * 1024
 
+#: Poslední průjezdy, které server vzal — pro červenou kontrolku na displeji
+#: (Davidovo zadání 20. 8. 2026: „nešlo by, aby i krabička měla červenou
+#: kontrolku, když přijme průjezd?"). Krabička protokolu nerozumí, takže se
+#: nepočítají rámce (dekodér posílá i status), ale `stored` z odpovědi
+#: serveru — kontrolka tak svítí jen za průjezdy, které opravdu dojely.
+_prujezdy_lock = threading.Lock()
+_prujezdy = {"kdy": 0.0, "celkem": 0}
+
+#: Jak dlouho po průjezdu kontrolka svítí. Displej se obnovuje po 5 s, takže
+#: kratší puls by mezi dvěma obnoveními zapadl.
+PRUJEZD_SVITI_S = 10.0
+
+
+def _zaznamenat_prujezdy(stored: int) -> None:
+    if stored <= 0:
+        return
+    with _prujezdy_lock:
+        _prujezdy["kdy"] = time.monotonic()
+        _prujezdy["celkem"] += stored
+
+
+def _prujezdy_stav() -> dict:
+    with _prujezdy_lock:
+        kdy, celkem = _prujezdy["kdy"], _prujezdy["celkem"]
+    return {
+        "celkem": celkem,
+        "cerstvy": bool(kdy) and (time.monotonic() - kdy) < PRUJEZD_SVITI_S,
+    }
+
 
 def _split_frames(buffer: bytearray) -> list[bytes]:
     """Vytáhne celé rámce SOR…EOR a nedokončený zbytek nechá v bufferu."""
@@ -478,7 +507,9 @@ class StreamLink:
                     # neznámá smyčka) — držet takovou dávku nemá smysl; co by
                     # chybělo, server dotáhne záložkou, až si proud řekne.
                     del backlog[: len(batch)]
-                    if not answer.get("ok") and answer.get("error"):
+                    if answer.get("ok"):
+                        _zaznamenat_prujezdy(int(answer.get("stored") or 0))
+                    elif answer.get("error"):
                         log(f"Server dávku nevzal: {answer['error']}")
 
             if now - last_service_at >= service_seconds and service:
@@ -954,6 +985,16 @@ _STYLE = """
  .slovo {{ color:{barva}; font-weight:900; line-height:1; text-shadow:0 0 10px {zare};
            font-size:clamp(2.5rem, 8vw, 7rem); }}
  .detail {{ margin:10px 0 0; color:#a1a1aa; font-size:clamp(.8rem,1.8vw,1.05rem); text-align:center; }}
+ /* Kontrolka průjezdu: červeně pulsuje ~10 s po průjezdu, který server vzal
+    (displej se obnovuje po 5 s, kratší puls by zapadl). Jinak šedě s počtem. */
+ .prujezd {{ margin:8px 0 0; display:flex; align-items:center; gap:8px; justify-content:center;
+   color:#a1a1aa; font-weight:700; letter-spacing:.06em; text-transform:uppercase;
+   font-size:clamp(.75rem,1.7vw,1rem); }}
+ .prujezd .svetlo {{ width:.85em; height:.85em; border-radius:50%; background:#3f3f46; flex-shrink:0; }}
+ .prujezd.zije {{ color:#fca5a5; }}
+ .prujezd.zije .svetlo {{ background:#ef4444; box-shadow:0 0 12px rgba(239,68,68,.9);
+   animation:prujezd-puls 1s ease-in-out infinite; }}
+ @keyframes prujezd-puls {{ 50% {{ opacity:.35; }} }}
  .tokenblok {{ padding-top:14px; }}
  .tokenramecek {{ margin-top:10px; border-radius:16px; border:2px solid rgba(132,204,22,.8);
                   padding:14px 18px; text-align:center;
@@ -986,6 +1027,7 @@ _STYLE = """
    .kolecko {{ width:2.6rem; height:2.6rem; border-width:3px; font-size:1.3rem; }}
    .slovo {{ font-size:2.1rem; }}
    .detail {{ margin-top:4px; font-size:.62rem; }}
+   .prujezd {{ margin-top:3px; font-size:.58rem; gap:5px; }}
    .tokenblok {{ padding-top:5px; }}
    .tokenramecek {{ margin-top:4px; padding:6px 8px; border-radius:10px; }}
    code {{ font-size:2.3rem; letter-spacing:.03em; }}
@@ -1012,6 +1054,7 @@ _SCREEN = """<!doctype html>
    <div class="slovo">{slovo}</div>
   </div>
   <p class="detail">{detail}</p>
+  {prujezd}
  </section>
 
  <section class="tokenblok">
@@ -1186,6 +1229,23 @@ def _tlacitko_html() -> str:
     )
 
 
+def _prujezd_html() -> str:
+    """Kontrolka průjezdu pod stavem serveru.
+
+    Ukazuje se, až když nějaký průjezd dojel — do té doby by šedé „0" jen
+    mátlo vedle token flow. Červeně pulsuje ~10 s po posledním vzatém
+    průjezdu, pak zšedne a zůstane počet za běh agenta.
+    """
+    stav = _prujezdy_stav()
+    if not stav["celkem"]:
+        return ""
+    trida = "prujezd zije" if stav["cerstvy"] else "prujezd"
+    return (
+        f'<p class="{trida}"><span class="svetlo"></span>'
+        f'průjezdy: {stav["celkem"]}</p>'
+    )
+
+
 def _render_screen(worker, config: dict) -> bytes:
     state = _screen_state(worker, config)
     style = _STYLE.format(barva=state["barva"], zare=state["zare"])
@@ -1195,6 +1255,7 @@ def _render_screen(worker, config: dict) -> bytes:
         znak=state["znak"],
         slovo=state["slovo"],
         detail=state["detail"],
+        prujezd=_prujezd_html(),
         token_popisek=state["token_popisek"],
         token=_token_html(state["token"]),
         tlacitko=_tlacitko_html(),

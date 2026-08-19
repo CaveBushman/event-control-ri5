@@ -31,6 +31,7 @@ import json
 import os
 import pathlib
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -239,10 +240,64 @@ def tcp_exchange(args: dict) -> dict:
                 raise
 
 
+def udp_discover(args: dict) -> dict:
+    """Broadcast do místní sítě a sběr odpovědí — hledání dekodérů.
+
+    Jediná věc, kterou agent dělá po UDP. Důvod je ten samý, proč vůbec
+    existuje: broadcast musí vyjít **ze sítě, kde dekodéry stojí**. Server
+    v datovém centru ho pošle nanejvýš svým sousedům, takže „Dohledat MAC
+    adresy" tam vracelo prázdno, i když všechno ostatní přes agenta prošlo
+    (nález 19. 8. 2026).
+
+    Agent protokolu nerozumí — pošle hotové bajty a vrátí, co se ozvalo,
+    včetně adresy odesílatele. Rozebrat rámce je věc serveru.
+
+    **Naslouchá se dřív, než se pošle:** dekodér odpovídá okamžitě a odpověď
+    na nenavázaný port by spadla do prázdna.
+    """
+    timeout = float(args.get("timeout") or 3.0)
+    payload = base64.b64decode(args.get("data") or "")
+    request_port = int(args.get("request_port") or 5403)
+    reply_port = int(args.get("reply_port") or 5303)
+
+    replies: list[dict] = []
+    seen: set[str] = set()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.bind(("", reply_port))
+        sock.settimeout(timeout)
+        sock.sendto(payload, ("255.255.255.255", request_port))
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            sock.settimeout(max(deadline - time.monotonic(), 0.05))
+            try:
+                data, sender = sock.recvfrom(4096)
+            except (socket.timeout, TimeoutError):
+                break
+            except OSError:
+                break
+            host = sender[0]
+            if host in seen:
+                continue
+            seen.add(host)
+            replies.append({"host": host, "data": base64.b64encode(data).decode("ascii")})
+    except OSError as exc:
+        # Port 5303 může držet jiný program (MyLaps Toolkit, druhá instance).
+        # Hledání se pak nekoná, ale agent kvůli tomu nepadá.
+        return {"replies": replies, "error": str(exc)}
+    finally:
+        sock.close()
+    return {"replies": replies}
+
+
 ACTIONS = {
     "tcp_probe": tcp_probe,
     "tcp_send": tcp_send,
     "tcp_exchange": tcp_exchange,
+    "udp_discover": udp_discover,
 }
 
 
@@ -442,6 +497,142 @@ def _autostart_body(command: list[str]) -> str:
         "[Desktop Entry]\nType=Application\nName=Event Control — agent u trati\n"
         f"Exec={quoted}\nX-GNOME-Autostart-enabled=true\nTerminal=false\n"
     )
+
+
+SERVICE_NAME = "event-control-agent.service"
+
+
+def service_paths() -> tuple[pathlib.Path, bool]:
+    """Kam zapsat unit systemd a jestli je systémová. Druhá hodnota = systémová."""
+    if os.geteuid() == 0:
+        return pathlib.Path("/etc/systemd/system") / SERVICE_NAME, True
+    base = pathlib.Path(
+        os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")
+    )
+    return base / "systemd" / "user" / SERVICE_NAME, False
+
+
+def _service_unit(command: list[str]) -> str:
+    quoted = " ".join(f'"{part}"' for part in command)
+    return (
+        "[Unit]\n"
+        "Description=Event Control — agent u trati\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        f"ExecStart={quoted}\n"
+        # Krabička u trati musí vstát sama: spadlý agent znamená závod bez
+        # časomíry a nikdo u trati nehlídá, jestli proces ještě žije.
+        "Restart=always\n"
+        "RestartSec=5\n"
+        "StartLimitIntervalSec=0\n"
+        f"WorkingDirectory={pathlib.Path.home()}\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+        if os.geteuid() == 0
+        else (
+            "[Unit]\n"
+            "Description=Event Control — agent u trati\n"
+            "After=network-online.target\n"
+            "\n"
+            "[Service]\n"
+            f"ExecStart={quoted}\n"
+            "Restart=always\n"
+            "RestartSec=5\n"
+            "StartLimitIntervalSec=0\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=default.target\n"
+        )
+    )
+
+
+def install_service() -> int:
+    """Zapíše a zapne službu systemd, která agenta po pádu i po restartu vrátí.
+
+    **Proč to nestačí přes „spouštět po startu"**: na Linuxu je to soubor
+    v `~/.config/autostart`, tedy věc plochy — bez přihlášené grafické session
+    se nespustí vůbec, a **spadlý proces nikdo nezvedne**. Krabička u trati
+    přitom stojí v garáži bez klávesnice a spadlý agent znamená závod bez
+    časomíry (David, 19. 8. 2026 — čtyři dny před prvním ostrým závodem).
+
+    Bez roota se instaluje **uživatelská** služba; aby běžela i bez přihlášení,
+    je potřeba `loginctl enable-linger`, což skript vypíše.
+    """
+    if not sys.platform.startswith("linux"):
+        print(
+            'Služba se instaluje jen na Linuxu (krabička u trati). '
+            'Na macOS drží agenta LaunchAgent s KeepAlive, na Windows '
+            'použijte volbu „Spouštět po startu počítače“ v nastavení.'
+        )
+        return 1
+
+    program = pathlib.Path(sys.argv[0]).resolve()
+    command = [str(program)] if getattr(sys, "frozen", False) else [sys.executable, str(program)]
+    path, system = service_paths()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_service_unit(command), encoding="utf-8")
+
+    scope = [] if system else ["--user"]
+    steps = [
+        ["systemctl", *scope, "daemon-reload"],
+        ["systemctl", *scope, "enable", SERVICE_NAME],
+        ["systemctl", *scope, "restart", SERVICE_NAME],
+    ]
+    for step in steps:
+        result = subprocess.run(step, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Nepovedlo se: {' '.join(step)}\n{result.stderr.strip()}")
+            return result.returncode
+        print(f"OK: {' '.join(step)}")
+
+    print(f"\nSlužba je v {path}")
+    if system:
+        print("Agent se spustí po startu i po pádu. Log: journalctl -u " + SERVICE_NAME + " -f")
+    else:
+        user = os.environ.get("USER") or "pi"
+        print(
+            "Agent se spustí po přihlášení a po pádu. Aby běžel i bez přihlášení:\n"
+            f"    sudo loginctl enable-linger {user}\n"
+            f"Log: journalctl --user -u {SERVICE_NAME} -f"
+        )
+    return 0
+
+
+def uninstall_service() -> int:
+    """Vypne a smaže službu — pro notebook, kde má agenta spouštět obsluha."""
+    if not sys.platform.startswith("linux"):
+        print("Služba existuje jen na Linuxu.")
+        return 1
+    path, system = service_paths()
+    scope = [] if system else ["--user"]
+    for step in (
+        ["systemctl", *scope, "disable", "--now", SERVICE_NAME],
+        ["systemctl", *scope, "daemon-reload"],
+    ):
+        subprocess.run(step, capture_output=True, text=True)
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    print(f"Služba odstraněna ({path}).")
+    return 0
+
+
+def service_state() -> str:
+    """Co říká systemd o službě — pro displej krabičky. Prázdné = neinstalovaná."""
+    if not sys.platform.startswith("linux"):
+        return ""
+    path, system = service_paths()
+    if not path.exists():
+        return ""
+    scope = [] if system else ["--user"]
+    result = subprocess.run(
+        ["systemctl", *scope, "is-active", SERVICE_NAME], capture_output=True, text=True
+    )
+    return (result.stdout or result.stderr or "").strip()
 
 
 def set_autostart(enabled: bool) -> pathlib.Path | None:
@@ -678,9 +869,31 @@ _SETTINGS = """<!doctype html>
  <p class="hint">Token krabičky: <code>{token}</code><br>
    Opište ho v aplikaci do <strong>Nastavení aplikace → Přihlásit krabičku</strong>.
    Uložený je v <code>{config}</code>.</p>
+
+ <h1 style="font-size:15px;margin-top:28px">Zkusit spojení na železo</h1>
+ <p class="hint" style="margin-top:4px">Ověří kabel a adresu <strong>bez serveru</strong> —
+   napište adresu dekodéru nebo kamery. Výsledek přibude do tabulky níž.</p>
+ <form method="post" action="/zkusit">
+  <label for="host">Adresa a port</label>
+  <div class="radek" style="margin-top:0">
+   <input type="text" id="host" name="host" value="{zkouska_host}" placeholder="192.168.9.25"
+          style="flex:1">
+   <input type="text" name="port" value="{zkouska_port}" placeholder="5403"
+          style="width:96px">
+  </div>
+  <button type="submit">Zkusit</button>
+ </form>
+
+ <h1 style="font-size:15px;margin-top:28px">Služba (doporučeno pro krabičku)</h1>
+ <p class="hint" style="margin-top:4px">{sluzba}</p>
  {spojeni}
  <p class="hint"><a href="/">zpět na displej</a></p>
 </main></body></html>"""
+
+
+#: Poslední ručně zkoušená adresa — displej ji nabídne znovu, obsluha
+#: u trati nemá překlepávat IP dekodéru dvakrát.
+_posledni_zkouska: dict = {"host": "", "port": ""}
 
 
 def _recent_table() -> str:
@@ -790,6 +1003,32 @@ def _render_screen(worker, config: dict) -> bytes:
     return page.encode("utf-8")
 
 
+def _service_hint() -> str:
+    """Co na displeji stojí o službě — podle toho, jestli je nainstalovaná.
+
+    Krabička u trati musí po pádu i po restartu vstát sama; „spouštět po
+    startu" je na Linuxu jen soubor plochy a spadlý proces nikdo nezvedne.
+    """
+    if not sys.platform.startswith("linux"):
+        return (
+            "Na tomhle systému se služba neinstaluje — agenta drží volba "
+            "„Spouštět po startu počítače“ výše."
+        )
+    state = service_state()
+    if not state:
+        return (
+            "Není nainstalovaná. Agent se po pádu sám nevrátí. Na krabičce ji "
+            "zapněte příkazem <code>sudo python3 track_agent.py "
+            "--install-service</code> — pak vstane po pádu i po restartu."
+        )
+    if state == "active":
+        return "Běží jako služba (<code>Restart=always</code>) — po pádu i po restartu se vrátí sama."
+    return (
+        f"Nainstalovaná, ale systemd hlásí <code>{state}</code>. "
+        "Log: <code>journalctl -u event-control-agent.service -f</code>"
+    )
+
+
 def _render_settings(worker, config: dict) -> bytes:
     page = _SETTINGS.format(
         stav=(worker.status if worker else "nespuštěno"),
@@ -797,6 +1036,9 @@ def _render_settings(worker, config: dict) -> bytes:
         autostart="checked" if config.get("autostart") else "",
         token=(config.get("token") or "—"),
         config=config_path(),
+        sluzba=_service_hint(),
+        zkouska_host=_posledni_zkouska.get("host", ""),
+        zkouska_port=_posledni_zkouska.get("port", ""),
         spojeni=_recent_table(),
     )
     return page.encode("utf-8")
@@ -844,6 +1086,31 @@ def build_web_server(state: dict, *, host: str, port: int):
             length = int(self.headers.get("Content-Length") or 0)
             form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
             saved = load_config()
+
+            if self.path.startswith("/zkusit"):
+                # Test spojení **bez serveru**: obsluha u trati potřebuje před
+                # závodem vědět, že kabel a adresa sedí, i když je internet
+                # zrovna mimo (David, 19. 8. 2026).
+                host = (form.get("host", [""])[0] or "").strip()
+                raw_port = (form.get("port", [""])[0] or "").strip()
+                _posledni_zkouska["host"] = host
+                _posledni_zkouska["port"] = raw_port
+                try:
+                    port = int(raw_port)
+                except ValueError:
+                    _remember(host or "—", 0, False, "port není číslo")
+                else:
+                    # `tcp_probe` výsledek nevrací — úspěch i selhání zapisuje
+                    # `_remember`, takže se objeví v tabulce níž. Výjimka tady
+                    # nesmí spadnout do HTTP odpovědi: displej by místo
+                    # výsledku ukázal chybu serveru.
+                    try:
+                        tcp_probe({"host": host, "port": port, "timeout": 3.0})
+                        log(f"Zkouška spojení {host}:{port} → odpovědělo")
+                    except Exception as exc:  # noqa: BLE001
+                        log(f"Zkouška spojení {host}:{port} → {exc}")
+                self._send(b"", status=303, headers=[("Location", "/nastaveni")])
+                return
 
             if self.path.startswith("/novy-token"):
                 global _novy_token_pozadan
@@ -942,7 +1209,25 @@ def main(argv: list[str] | None = None) -> int:
             "krabička u trati potřebuje 0.0.0.0, aby se na ni dalo z jiného stroje."
         ),
     )
+    parser.add_argument(
+        "--install-service",
+        action="store_true",
+        help=(
+            "Zapíše a zapne službu systemd s automatickým restartem — "
+            "krabička u trati po pádu i po restartu vstane sama."
+        ),
+    )
+    parser.add_argument(
+        "--uninstall-service",
+        action="store_true",
+        help="Službu vypne a smaže (pro notebook, kde agenta spouští obsluha).",
+    )
     args = parser.parse_args(argv)
+
+    if args.install_service:
+        return install_service()
+    if args.uninstall_service:
+        return uninstall_service()
 
     saved = load_config()
     server_url = args.server or configured_server(saved)

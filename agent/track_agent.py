@@ -38,7 +38,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0"
+VERSION = "1.1"
 
 #: Kam se agent hlásí, když mu nikdo neřekl jinak. Aplikace běží na jednom
 #: místě, takže adresu nemá co obsluha u trati vypisovat — krabička po zapnutí
@@ -88,8 +88,20 @@ class Server:
         )
 
     def commands(self) -> list[dict]:
-        answer = self._request("/bmx/api/agent/commands/", timeout=READ_TIMEOUT)
+        answer = self.poll()
         return answer.get("commands") or []
+
+    def poll(self) -> dict:
+        """Dlouhý dotaz: příkazy k vyřízení + konfigurace proudu průjezdů."""
+        return self._request("/bmx/api/agent/commands/", timeout=READ_TIMEOUT)
+
+    def push_passings(self, decoder_id: str, frames: list[str]) -> dict:
+        """Pošle rámce průjezdů hned, jak je dekodér vydal (base64)."""
+        return self._request(
+            "/bmx/api/agent/passings/",
+            {"decoder": decoder_id, "frames": frames},
+            timeout=15.0,
+        )
 
     def result(self, command_id: str, ok: bool, data: dict | None = None, error: str = "") -> None:
         self._request(
@@ -320,6 +332,160 @@ def run_command(server: Server, command: dict) -> None:
     server.result(command.get("id"), True, data=data)
 
 
+# --- proud průjezdů --------------------------------------------------------
+#
+# Dekodér posílá průjezdy sám (v příručce P3 značka „A" — send autonomously),
+# takže na ně netřeba čekat dotazem. Krabička drží spojení otevřené — stejně,
+# jako ho v přímém režimu drží server — a každý rámec hned POSTne do aplikace.
+# Do 19. 8. 2026 se průjezdy jen stahovaly na dotaz serveru po 1,5 s a každý
+# dotaz stál dvě cesty přes internet; od smyčky k obrazovce to dělalo 2–4 s.
+#
+# Krabička protokolu P3 **nerozumí**: otevírací rámce (watchdog, resend od
+# záložky) jí předchystá server v konfiguraci proudu a ona jen řeže příchozí
+# bajty na rámce podle SOR/EOR — uvnitř rámce jsou tyhle bajty escapované,
+# takže se s obsahem nespletou.
+
+STREAM_SOR = 0x8E
+STREAM_EOR = 0x8F
+
+#: Průjezdy se posílají po skupinkách: osm jezdců projede cílem ve zlomku
+#: sekundy a POST na každý zvlášť by byl osminásobný provoz. Delší čekání by
+#: zdržovalo obrazovku, takže jen okamžik.
+STREAM_QUIET_SECONDS = 0.3
+STREAM_MAX_FRAMES = 50
+
+#: Kolik rámců smí čekat na odeslání, když server zrovna nebere. Víc znamená
+#: výpadek — zahodit a nechat server dotáhnout záložkou (od té se stahuje
+#: jen to, co nedošlo).
+STREAM_BACKLOG_MAX = 2000
+
+#: Strop bufferu proudu — rámec má desítky bajtů; víc bez konce rámce je
+#: rozsypaný proud, ne data (stejná pojistka jako na serveru).
+STREAM_BUFFER_MAX = 256 * 1024
+
+
+def _split_frames(buffer: bytearray) -> list[bytes]:
+    """Vytáhne celé rámce SOR…EOR a nedokončený zbytek nechá v bufferu."""
+    frames: list[bytes] = []
+    while True:
+        try:
+            start = buffer.index(STREAM_SOR)
+        except ValueError:
+            buffer.clear()
+            return frames
+        if start:
+            del buffer[:start]
+        try:
+            end = buffer.index(STREAM_EOR, 1)
+        except ValueError:
+            return frames
+        frames.append(bytes(buffer[: end + 1]))
+        del buffer[: end + 1]
+
+
+class StreamLink:
+    """Jedno trvalé spojení na dekodér: čte proud a posílá rámce serveru."""
+
+    def __init__(self, server: Server, config: dict):
+        self.server = server
+        self.config = dict(config)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"stream-{config.get('host')}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def matches(self, config: dict) -> bool:
+        """Stejná smyčka a stejné otevírací rámce — spojení může běžet dál.
+
+        Otevírací rámce se mění se záložkou serveru; přehrávají se jen při
+        (re)connectu, takže běžící spojení kvůli nim netřeba trhat.
+        """
+        for key in ("decoder", "host", "port", "service", "service_seconds"):
+            if self.config.get(key) != config.get(key):
+                return False
+        return True
+
+    def _run(self) -> None:
+        host = str(self.config.get("host", ""))
+        port = int(self.config.get("port") or 0)
+        decoder_id = str(self.config.get("decoder", ""))
+        service = base64.b64decode(self.config.get("service") or b"")
+        service_seconds = float(self.config.get("service_seconds") or 10)
+        backoff = RECONNECT_MIN
+        backlog: list[str] = []
+
+        while not self._stop.is_set():
+            try:
+                with socket.create_connection((host, port), timeout=3.0) as sock:
+                    sock.settimeout(1.0)
+                    _remember(host, port, True, "proud průjezdů")
+                    log(f"Proud {host}:{port} otevřen")
+                    for encoded in self.config.get("open") or []:
+                        sock.sendall(base64.b64decode(encoded))
+                    backoff = RECONNECT_MIN
+                    self._pump(sock, decoder_id, service, service_seconds, backlog)
+            except (OSError, TimeoutError, ValueError) as exc:
+                _remember(host, port, False, str(exc))
+            if self._stop.wait(backoff):
+                return
+            backoff = min(backoff * 2, RECONNECT_MAX)
+
+    def _pump(self, sock, decoder_id, service, service_seconds, backlog) -> None:
+        buffer = bytearray()
+        last_frame_at = time.monotonic()
+        last_service_at = time.monotonic()
+
+        while not self._stop.is_set():
+            try:
+                chunk = sock.recv(8192)
+                if not chunk:
+                    raise ConnectionError("Dekodér spojení zavřel.")
+                buffer.extend(chunk)
+                if len(buffer) > STREAM_BUFFER_MAX:
+                    log(f"Proud {decoder_id[:8]} rozsypaný — buffer se zahazuje")
+                    buffer.clear()
+                for raw in _split_frames(buffer):
+                    backlog.append(base64.b64encode(raw).decode("ascii"))
+                    last_frame_at = time.monotonic()
+                if len(backlog) > STREAM_BACKLOG_MAX:
+                    # Server dlouho nebere — zahodit; dotáhne si to záložkou.
+                    del backlog[: len(backlog) - STREAM_BACKLOG_MAX]
+            except socket.timeout:
+                pass
+
+            now = time.monotonic()
+            quiet = now - last_frame_at >= STREAM_QUIET_SECONDS
+            if backlog and (quiet or len(backlog) >= STREAM_MAX_FRAMES):
+                batch = backlog[:STREAM_MAX_FRAMES]
+                try:
+                    answer = self.server.push_passings(decoder_id, batch)
+                except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+                    # Server nedostupný — dávka zůstává a zkusí se s další.
+                    pass
+                else:
+                    # ok:false znamená „nechci" (žádný závod si proud neříká,
+                    # neznámá smyčka) — držet takovou dávku nemá smysl; co by
+                    # chybělo, server dotáhne záložkou, až si proud řekne.
+                    del backlog[: len(batch)]
+                    if not answer.get("ok") and answer.get("error"):
+                        log(f"Server dávku nevzal: {answer['error']}")
+
+            if now - last_service_at >= service_seconds and service:
+                sock.sendall(service)
+                last_service_at = now
+
+
 # --- běh na pozadí ---------------------------------------------------------
 
 
@@ -337,6 +503,8 @@ class Worker:
         self._thread: threading.Thread | None = None
         self.connected = False
         self.status = "nespuštěno"
+        #: id smyčky -> běžící proud průjezdů (StreamLink)
+        self._streams: dict[str, StreamLink] = {}
 
     # -- řízení ------------------------------------------------------------
 
@@ -349,6 +517,7 @@ class Worker:
 
     def stop(self) -> None:
         self._stop.set()
+        self._sync_streams([])
         thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=2)
@@ -368,6 +537,35 @@ class Worker:
         except Exception:  # noqa: BLE001 — chyba v okénku nesmí shodit agenta
             pass
 
+    def _sync_streams(self, wanted: list[dict]) -> None:
+        """Srovná běžící proudy s konfigurací ze serveru.
+
+        Nová smyčka v konfiguraci → otevřít; zmizelá → zavřít; změněná
+        adresa nebo servis → přeotevřít. Otevírací rámce (mění se se
+        záložkou) běžící spojení netrhají — přehrávají se jen po výpadku.
+        """
+        by_id = {str(item.get("decoder", "")): item for item in wanted if item.get("decoder")}
+
+        for decoder_id in list(self._streams):
+            link = self._streams[decoder_id]
+            config = by_id.get(decoder_id)
+            if config is not None and link.matches(config) and link.is_alive():
+                link.config = dict(config)  # čerstvé otevírací rámce pro reconnect
+                continue
+            link.stop()
+            del self._streams[decoder_id]
+            if config is None:
+                log(f"Proud {decoder_id[:8]} ukončen — závod si ho už neříká")
+
+        if self._stop.is_set():
+            return
+        for decoder_id, config in by_id.items():
+            if decoder_id in self._streams:
+                continue
+            link = StreamLink(self.server, config)
+            self._streams[decoder_id] = link
+            link.start()
+
     def _run(self) -> None:
         backoff = RECONNECT_MIN
         greeted = False
@@ -382,7 +580,9 @@ class Worker:
                     organization = hello.get("organization")
                     self._set(f"připojen jako {name} ({organization})", connected=True)
 
-                for command in self.server.commands():
+                answer = self.server.poll()
+                self._sync_streams(answer.get("stream") or [])
+                for command in answer.get("commands") or []:
                     if self._stop.is_set():
                         break
                     host = (command.get("args") or {}).get("host", "")

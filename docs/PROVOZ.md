@@ -14,6 +14,15 @@ Krátký seznam pro obsluhu u trati. Podrobnosti jsou v `README.md`.
 
 Když něco z toho nesvítí, jde o síť, ne o aplikaci: viz *Když to nejde* níž.
 
+## Aktualizace
+
+Nejdřív se nasazuje **server**, potom krabička — ta si agenta stahuje ze
+serveru, takže obrácené pořadí by jí dalo starou verzi:
+
+```bash
+sudo bash scripts/update.sh     # stačí; deploy.sh dělá totéž a navíc projde nastavení
+```
+
 ## Během závodu
 
 Krabička nepotřebuje obsluhu. Na displeji je pořád vidět stav, takže se dá

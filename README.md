@@ -157,10 +157,21 @@ sudo bash scripts/update.sh                   # nová verze agenta ze serveru
 sudo systemctl restart event-control-agent    # restart
 ```
 
-Agent umí jen tři věci — připojit se, poslat bajty, vrátit, co přišlo. Znalost
-protokolů (MyLaps P3, XML cílové kamery) zůstává na serveru, takže **aktualizace
-aplikace neznamená aktualizaci krabiček**. `update.sh` se hodí jen tehdy, když
-se mění samotný způsob spojení.
+Agent umí jen čtyři věci — připojit se, poslat bajty, vrátit, co přišlo,
+a **držet proud průjezdů**: od verze 1.1 drží spojení na dekodér sám a každý
+průjezd hned pošle do aplikace (do té doby se průjezdy jen stahovaly na dotaz
+serveru po 1,5 s a od smyčky k obrazovce to trvalo 2–4 s). Ani proud ale
+neznamená, že agent protokolu rozumí: otevírací rámce P3 (watchdog, resend od
+záložky) mu **předchystá server** v konfiguraci a on jen řeže příchozí bajty
+na rámce. Znalost protokolů (MyLaps P3, XML cílové kamery) zůstává na serveru,
+takže **aktualizace aplikace neznamená aktualizaci krabiček**. `update.sh` se
+hodí jen tehdy, když se mění samotný způsob spojení — jako právě u proudu.
+
+**Pořadí při aktualizaci: nejdřív server, pak krabička.** `deploy.sh`
+i `update.sh` si agenta stahují ze serveru (`/bmx/api/agent/download/`),
+takže krabička dostane přesně tu verzi, se kterou nasazená aplikace počítá;
+kopie v repozitáři slouží jen pro stavbu bez sítě. Starší agent (1.0) se
+s novým serverem nerozbije — server mu nechá rychlé stahování po 1,5 s.
 
 ## Síť
 

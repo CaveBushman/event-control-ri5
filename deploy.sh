@@ -173,10 +173,29 @@ if [[ $WITH_KIOSK -eq 1 && -f /boot/firmware/config.txt ]]; then
 fi
 
 # --- 4. agent ---------------------------------------------------------------
+#
+# Zdroj agenta má pořadí: **server → kopie v repu**. Server vydává přesně tu
+# verzi, se kterou aplikace počítá (`/bmx/api/agent/download/` servíruje
+# `tools/track_agent.py` z nasazeného kódu), zatímco kopie na SD kartě je
+# stará jak poslední klonování. Bez sítě se jede z kopie — krabička se dá
+# postavit i offline a aktualizuje se, jakmile na server dosáhne
+# (`scripts/update.sh` nebo prostě druhé spuštění tohohle skriptu).
 
 krok "Agent"
 spust install -d -m 755 "$INSTALL_DIR"
-spust install -m 755 "$ROOT/agent/track_agent.py" "$INSTALL_DIR/track_agent.py"
+
+AGENT_ZDROJ="$ROOT/agent/track_agent.py"
+AGENT_TMP="$(mktemp)"
+trap 'rm -f "$AGENT_TMP"' EXIT
+if [[ -n "$SERVER" ]] && curl -fsSL --max-time 20 "$SERVER/bmx/api/agent/download/" -o "$AGENT_TMP" 2>/dev/null         && python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$AGENT_TMP" 2>/dev/null; then
+    AGENT_ZDROJ="$AGENT_TMP"
+    info "agent stažen ze serveru $SERVER"
+else
+    info "server nedostupný — agent z kopie v repozitáři"
+fi
+AGENT_VERZE="$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$AGENT_ZDROJ" | head -1)"
+info "verze agenta: ${AGENT_VERZE:-neznámá}"
+spust install -m 755 "$AGENT_ZDROJ" "$INSTALL_DIR/track_agent.py"
 spust install -m 644 "$ROOT/systemd/$AGENT_SERVICE.service" "/etc/systemd/system/$AGENT_SERVICE.service"
 
 # Adresa aplikace se zapíše rovnou, takže krabička po zapnutí ukáže token

@@ -38,7 +38,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 #: Kam se agent hlásí, když mu nikdo neřekl jinak. Aplikace běží na jednom
 #: místě, takže adresu nemá co obsluha u trati vypisovat — krabička po zapnutí
@@ -369,11 +369,36 @@ STREAM_BUFFER_MAX = 256 * 1024
 #: nepočítají rámce (dekodér posílá i status), ale `stored` z odpovědi
 #: serveru — kontrolka tak svítí jen za průjezdy, které opravdu dojely.
 _prujezdy_lock = threading.Lock()
-_prujezdy = {"kdy": 0.0, "celkem": 0}
+_prujezdy = {"kdy": 0.0, "celkem": 0, "ze_serveru": None}
 
 #: Jak dlouho po průjezdu kontrolka svítí. Displej se obnovuje po 5 s, takže
 #: kratší puls by mezi dvěma obnoveními zapadl.
 PRUJEZD_SVITI_S = 10.0
+
+
+def _zaznamenat_pocitadlo(celkem) -> None:
+    """Počítadlo průjezdů od serveru — kontrolka svítí i u stahované cesty.
+
+    Krabička protokolu nerozumí a když si průjezdy stahuje server sám, o nich
+    vůbec neví: displej pak zůstával tmavý, i když měření běželo (Davidův
+    nález 20. 8. 2026). Server posílá součet záložek dekodérů; jeho růst
+    znamená průjezd. První odpověď jen založí základ, jinak by kontrolka
+    blikla po každém startu agenta.
+    """
+    if celkem is None:
+        return
+    try:
+        celkem = int(celkem)
+    except (TypeError, ValueError):
+        return
+    with _prujezdy_lock:
+        znamy = _prujezdy["ze_serveru"]
+        _prujezdy["ze_serveru"] = celkem
+        if znamy is None or celkem <= znamy:
+            return
+        pribylo = celkem - znamy
+        _prujezdy["kdy"] = time.monotonic()
+        _prujezdy["celkem"] += pribylo
 
 
 def _zaznamenat_prujezdy(stored: int) -> None:
@@ -476,6 +501,17 @@ class StreamLink:
         last_service_at = time.monotonic()
 
         while not self._stop.is_set():
+            # Jakmile leží v backlogu první průjezd, nesmí nás další
+            # `recv()` na celou sekundu zablokovat. Dřív se deklarované
+            # 0,3s dávkovací okno kontrolovalo až po 1s socket timeoutu,
+            # takže samotná krabička spotřebovala celý požadovaný limit.
+            if backlog:
+                quiet_left = STREAM_QUIET_SECONDS - (
+                    time.monotonic() - last_frame_at
+                )
+                sock.settimeout(max(0.01, min(STREAM_QUIET_SECONDS, quiet_left)))
+            else:
+                sock.settimeout(1.0)
             try:
                 chunk = sock.recv(8192)
                 if not chunk:
@@ -612,6 +648,7 @@ class Worker:
                     self._set(f"připojen jako {name} ({organization})", connected=True)
 
                 answer = self.server.poll()
+                _zaznamenat_pocitadlo(answer.get("passings"))
                 self._sync_streams(answer.get("stream") or [])
                 for command in answer.get("commands") or []:
                     if self._stop.is_set():
@@ -985,16 +1022,23 @@ _STYLE = """
  .slovo {{ color:{barva}; font-weight:900; line-height:1; text-shadow:0 0 10px {zare};
            font-size:clamp(2.5rem, 8vw, 7rem); }}
  .detail {{ margin:10px 0 0; color:#a1a1aa; font-size:clamp(.8rem,1.8vw,1.05rem); text-align:center; }}
- /* Kontrolka průjezdu: červeně pulsuje ~10 s po průjezdu, který server vzal
-    (displej se obnovuje po 5 s, kratší puls by zapadl). Jinak šedě s počtem. */
- .prujezd {{ margin:8px 0 0; display:flex; align-items:center; gap:8px; justify-content:center;
-   color:#a1a1aa; font-weight:700; letter-spacing:.06em; text-transform:uppercase;
-   font-size:clamp(.75rem,1.7vw,1rem); }}
- .prujezd .svetlo {{ width:.85em; height:.85em; border-radius:50%; background:#3f3f46; flex-shrink:0; }}
- .prujezd.zije {{ color:#fca5a5; }}
- .prujezd.zije .svetlo {{ background:#ef4444; box-shadow:0 0 12px rgba(239,68,68,.9);
+ /* Kontrolka průjezdu. Na displej u trati se kouká z metru a přes rameno,
+    takže to musí být PRUH přes celou šířku, ne tečka — první verze byla tak
+    malá, že ji nebylo vidět (David, 20. 8. 2026). Červeně pulsuje ~10 s po
+    průjezdu (displej se obnovuje po 5 s, kratší puls by zapadl), pak zšedne
+    a drží počet za běh agenta. */
+ .prujezd {{ margin:10px 0 0; display:flex; align-items:center; gap:14px;
+   justify-content:center; border-radius:14px; border:2px solid #27272a;
+   background:rgba(255,255,255,.02); padding:8px 16px;
+   color:#a1a1aa; font-weight:900; letter-spacing:.08em; text-transform:uppercase;
+   font-size:clamp(1rem,3vw,2rem); line-height:1; }}
+ .prujezd .svetlo {{ width:1em; height:1em; border-radius:50%; background:#3f3f46;
+   flex-shrink:0; }}
+ .prujezd.zije {{ color:#fff; border-color:#ef4444; background:rgba(239,68,68,.18);
+   box-shadow:0 0 26px rgba(239,68,68,.45); }}
+ .prujezd.zije .svetlo {{ background:#ef4444; box-shadow:0 0 18px rgba(239,68,68,1);
    animation:prujezd-puls 1s ease-in-out infinite; }}
- @keyframes prujezd-puls {{ 50% {{ opacity:.35; }} }}
+ @keyframes prujezd-puls {{ 50% {{ opacity:.3; }} }}
  .tokenblok {{ padding-top:14px; }}
  .tokenramecek {{ margin-top:10px; border-radius:16px; border:2px solid rgba(132,204,22,.8);
                   padding:14px 18px; text-align:center;
@@ -1027,7 +1071,9 @@ _STYLE = """
    .kolecko {{ width:2.6rem; height:2.6rem; border-width:3px; font-size:1.3rem; }}
    .slovo {{ font-size:2.1rem; }}
    .detail {{ margin-top:4px; font-size:.62rem; }}
-   .prujezd {{ margin-top:3px; font-size:.58rem; gap:5px; }}
+   /* Malý displej (MHS35 480×320): pruh zůstává čitelný, jen se stáhne. */
+   .prujezd {{ margin-top:4px; font-size:.95rem; gap:8px; padding:4px 8px;
+     border-radius:8px; border-width:1px; }}
    .tokenblok {{ padding-top:5px; }}
    .tokenramecek {{ margin-top:4px; padding:6px 8px; border-radius:10px; }}
    code {{ font-size:2.3rem; letter-spacing:.03em; }}
@@ -1239,9 +1285,13 @@ def _prujezd_html() -> str:
     stav = _prujezdy_stav()
     if not stav["celkem"]:
         return ""
-    trida = "prujezd zije" if stav["cerstvy"] else "prujezd"
+    if stav["cerstvy"]:
+        return (
+            '<p class="prujezd zije"><span class="svetlo"></span>'
+            f'PRŮJEZD · {stav["celkem"]}</p>'
+        )
     return (
-        f'<p class="{trida}"><span class="svetlo"></span>'
+        '<p class="prujezd"><span class="svetlo"></span>'
         f'průjezdy: {stav["celkem"]}</p>'
     )
 

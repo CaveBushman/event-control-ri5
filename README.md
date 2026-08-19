@@ -141,9 +141,9 @@ Tři stavy, které displej ukazuje:
 * V horní liště aplikace svítí kontrolky **Hill**, **Finish** a **Kamera**.
 * Tlačítko **Dohledat MAC adresy** projde i z produkce.
 * **Průjezdy naskakují do Parsingu** — to je ta hlavní věc, kvůli které
-  krabička je. Odběr se ptá dekodérů po sekundě a půl na to, co ještě
-  nedorazilo. Když se nic neobjevuje, bývá to dnem závodu: dekodér drží pamět
-  i z předchozích závodů a aplikace průjezdy z jiného dne zahazuje.
+  krabička je. Agent 1.2 je aktivně posílá nejpozději po 0,3 s ticha;
+  serverové dohledání od záložky je jen pojistka po výpadku. Když se nic
+  neobjevuje, zkontrolujte verzi agenta, běžící měření a datum závodu.
 
 Když krabička neběží, aplikace se chová jako dřív a spojení zkouší navázat
 sama — u trati to nefunguje, ale nic se nerozbije.
@@ -159,8 +159,10 @@ sudo systemctl restart event-control-agent    # restart
 
 Agent umí jen čtyři věci — připojit se, poslat bajty, vrátit, co přišlo,
 a **držet proud průjezdů**: od verze 1.1 drží spojení na dekodér sám a každý
-průjezd hned pošle do aplikace (do té doby se průjezdy jen stahovaly na dotaz
-serveru po 1,5 s a od smyčky k obrazovce to trvalo 2–4 s). Ani proud ale
+průjezd hned pošle do aplikace; verze 1.2 hlídá skutečný 0,3s limit odeslání
+(do verze 1.1 mohl sekundový socket timeout odeslání zdržet). Do verze 1.0
+se průjezdy jen stahovaly na dotaz
+serveru po 1,5 s a od smyčky k obrazovce to trvalo 2–4 s. Ani proud ale
 neznamená, že agent protokolu rozumí: otevírací rámce P3 (watchdog, resend od
 záložky) mu **předchystá server** v konfiguraci a on jen řeže příchozí bajty
 na rámce. Znalost protokolů (MyLaps P3, XML cílové kamery) zůstává na serveru,

@@ -369,7 +369,17 @@ STREAM_BUFFER_MAX = 256 * 1024
 #: nepočítají rámce (dekodér posílá i status), ale `stored` z odpovědi
 #: serveru — kontrolka tak svítí jen za průjezdy, které opravdu dojely.
 _prujezdy_lock = threading.Lock()
-_prujezdy = {"kdy": 0.0, "celkem": 0, "ze_serveru": None, "naposledy": ""}
+#: `smycka_kdy` = kdy naposledy dorazil rámec z dekodéru (příjem ze smyčky),
+#: `server_kdy` = kdy server dávku přijal. Dvě razítka, protože displej podle
+#: návrhu Ri5 v2 (20. 8. 2026) ukazuje cestu průjezdu zvlášť: smyčka → server.
+_prujezdy = {
+    "kdy": 0.0, "celkem": 0, "ze_serveru": None, "naposledy": "",
+    "smycka_kdy": 0.0, "server_kdy": 0.0,
+}
+
+#: Jak dlouho svítí dioda smyčky/serveru. Je to **puls**, ne stav: delší
+#: svícení by z „právě přišel průjezd" udělalo „něco se kdysi stalo".
+LED_SVITI_S = 2.2
 
 #: Jak dlouho po průjezdu kontrolka svítí. Displej se obnovuje po 1 s; deset
 #: sekund dává obsluze dost času potvrzení bezpečně zahlédnout.
@@ -398,6 +408,11 @@ def _zaznamenat_pocitadlo(celkem) -> None:
             return
         pribylo = celkem - znamy
         _prujezdy["kdy"] = time.monotonic()
+        # Stahovaná cesta: o průjezdu víme až od serveru, takže se rozsvítí
+        # obě diody naráz. Jinak by u staré krabičky (1.0) zůstala levá
+        # dioda navěky tmavá, i když měření běží.
+        _prujezdy["smycka_kdy"] = time.monotonic()
+        _prujezdy["server_kdy"] = time.monotonic()
         _prujezdy["celkem"] += pribylo
         _prujezdy["naposledy"] = time.strftime("%H:%M:%S")
 
@@ -407,6 +422,7 @@ def _zaznamenat_prujezdy(stored: int) -> None:
         return
     with _prujezdy_lock:
         _prujezdy["kdy"] = time.monotonic()
+        _prujezdy["server_kdy"] = time.monotonic()
         _prujezdy["celkem"] += stored
         _prujezdy["naposledy"] = time.strftime("%H:%M:%S")
         # Aktivní POST rozsvítí displej okamžitě. Stejný průjezd se ale za
@@ -416,15 +432,31 @@ def _zaznamenat_prujezdy(stored: int) -> None:
             _prujezdy["ze_serveru"] += stored
 
 
+def _zaznamenat_smycku() -> None:
+    """Z dekodéru přišel rámec — dioda „smyčka" se rozsvítí okamžitě.
+
+    Krabička neví, jestli je ten rámec průjezd (P3 nezná) a vědět to nemá:
+    pro obsluhu u trati je podstatné, že se smyčka **ozvala**. Že se z toho
+    stal průjezd, potvrdí až server druhou diodou.
+    """
+    with _prujezdy_lock:
+        _prujezdy["smycka_kdy"] = time.monotonic()
+
+
 def _prujezdy_stav() -> dict:
     with _prujezdy_lock:
-        kdy = _prujezdy["kdy"]
-        celkem = _prujezdy["celkem"]
-        naposledy = _prujezdy["naposledy"]
+        snapshot = dict(_prujezdy)
+    now = time.monotonic()
+
+    def sviti(razitko: float, delka: float) -> bool:
+        return bool(razitko) and (now - razitko) < delka
+
     return {
-        "celkem": celkem,
-        "cerstvy": bool(kdy) and (time.monotonic() - kdy) < PRUJEZD_SVITI_S,
-        "naposledy": naposledy,
+        "celkem": snapshot["celkem"],
+        "cerstvy": sviti(snapshot["kdy"], PRUJEZD_SVITI_S),
+        "smycka": sviti(snapshot["smycka_kdy"], LED_SVITI_S),
+        "server": sviti(snapshot["server_kdy"], LED_SVITI_S),
+        "naposledy": snapshot["naposledy"],
     }
 
 
@@ -533,6 +565,7 @@ class StreamLink:
                 for raw in _split_frames(buffer):
                     backlog.append(base64.b64encode(raw).decode("ascii"))
                     last_frame_at = time.monotonic()
+                    _zaznamenat_smycku()
                 if len(backlog) > STREAM_BACKLOG_MAX:
                     # Server dlouho nebere — zahodit; dotáhne si to záložkou.
                     del backlog[: len(backlog) - STREAM_BACKLOG_MAX]
@@ -1004,123 +1037,308 @@ def ensure_token(config: dict) -> str:
 WEB_PORT = 8088
 
 _STYLE = """
+ /* Displej krabičky podle návrhu `bikody_ri5_v2.html` (David, 20. 8. 2026).
+    Návrh stojí na Tailwindu z CDN; tady je přepsaný do vlastního CSS —
+    krabička u trati bývá bez internetu a stránka z CDN by se jí nenačetla
+    vůbec. Rozměry jdou z `clamp()` stejně jako v návrhu, takže obrazovka
+    sedne na monitor i na 3,5" SPI displej. */
  :root {{ color-scheme: dark; }}
  * {{ box-sizing: border-box; }}
- html, body {{ margin:0; height:100%; background:#050505; overflow:hidden;
-               font-family: system-ui, Arial, Helvetica, sans-serif; color:#fff; }}
- main {{ height:100%; display:flex; align-items:center; justify-content:center; padding:12px;
-         background: radial-gradient(circle at 50% 30%, rgba(38,38,38,.28), transparent 45%),
-                     linear-gradient(180deg, #090b0c 0%, #050607 100%); }}
- .ramecek {{ width:100%; height:100%; max-width:900px; max-height:520px; border-radius:28px;
-             border:1px solid rgba(63,63,70,.6); background:rgba(0,0,0,.8); padding:16px;
-             box-shadow:0 25px 50px -12px rgba(0,0,0,.6); }}
- .vnitrek {{ height:100%; border-radius:20px; border:1px solid #27272a; background:rgba(0,0,0,.4);
-             padding:16px 24px; display:flex; flex-direction:column; }}
- header {{ text-align:center; border-bottom:1px solid #27272a; padding-bottom:14px; }}
- h1 {{ margin:0; font-weight:900; letter-spacing:.14em; line-height:1;
-       font-size:clamp(2rem, 7vw, 4.6rem); }}
+ html, body {{ margin:0; width:100%; height:100%; background:#050505; overflow:hidden;
+               font-family: Arial, Helvetica, sans-serif; color:#fff; }}
+ main {{ width:100vw; height:100vh; padding:16px;
+         background: radial-gradient(circle at 50% 20%, rgba(30,34,36,.45), transparent 35%),
+                     linear-gradient(180deg, #070809 0%, #020303 100%); }}
+ .ramecek {{ width:100%; height:100%; border-radius:28px; border:1px solid #27272a;
+             background:rgba(0,0,0,.8); padding:16px; display:flex; flex-direction:column;
+             gap:16px; }}
+
+ /* Hlavička: značka vlevo, hodiny a datum vpravo, červená linka pod tím. */
+ header {{ display:flex; align-items:center; justify-content:space-between;
+           border-bottom:2px solid #dc2626; padding-bottom:12px; }}
+ h1 {{ margin:0; font-weight:900; letter-spacing:.11em; line-height:1;
+       font-size:clamp(2rem, 6vw, 4.5rem); }}
  h1 .tecka {{ color:#ef4444; }}
- .stav {{ flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
-          border-bottom:1px solid #27272a; padding:14px 0; }}
- .popisek {{ text-transform:uppercase; letter-spacing:.08em; color:#e4e4e7; font-weight:600;
-             font-size:clamp(1rem, 2.5vw, 1.8rem); margin:0; }}
- .vysledek {{ margin-top:12px; display:flex; align-items:center; gap:20px; }}
- .kolecko {{ width:clamp(5rem,9vw,7rem); height:clamp(5rem,9vw,7rem); border-radius:50%;
+ .hodiny {{ text-align:right; }}
+ .hodiny .cas {{ font-weight:900; line-height:1; font-size:clamp(1.5rem, 4vw, 3rem); }}
+ .hodiny .datum {{ margin-top:4px; color:#d4d4d8; font-size:clamp(.75rem, 1.8vw, 1.2rem); }}
+
+ /* Dvě karty na polovinu: stav serveru a tlačítko nového tokenu. */
+ .dvojice {{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }}
+ .karta {{ border-radius:24px; border:2px solid {barva}; background:rgba(0,0,0,.4);
+           padding:16px; display:flex; flex-direction:column; align-items:center;
+           justify-content:center; min-height:145px; }}
+ .karta .popisek {{ text-transform:uppercase; letter-spacing:.05em; font-weight:900;
+                    font-size:clamp(1rem, 2.6vw, 1.8rem); margin:0; }}
+ .vysledek {{ margin-top:12px; display:flex; align-items:center; gap:16px; }}
+ .kolecko {{ width:clamp(4rem,7vw,6rem); height:clamp(4rem,7vw,6rem); border-radius:50%;
              border:5px solid {barva}; display:flex; align-items:center; justify-content:center;
-             color:{barva}; font-size:clamp(2.5rem,6vw,4rem); font-weight:900;
-             text-shadow:0 0 10px {zare}; }}
+             color:{barva}; font-size:clamp(2rem,4.5vw,3.5rem); font-weight:900; }}
  .slovo {{ color:{barva}; font-weight:900; line-height:1; text-shadow:0 0 10px {zare};
-           font-size:clamp(2.5rem, 8vw, 7rem); }}
- .detail {{ margin:10px 0 0; color:#a1a1aa; font-size:clamp(.8rem,1.8vw,1.05rem); text-align:center; }}
- /* Kontrolka průjezdu. Na displej u trati se kouká z metru a přes rameno,
-    takže to musí být PRUH přes celou šířku, ne tečka — první verze byla tak
-    malá, že ji nebylo vidět (David, 20. 8. 2026). Červeně pulsuje ~10 s po
-    průjezdu (displej se obnovuje po 1 s), pak zšedne
-    a drží počet za běh agenta. */
- .prujezd {{ margin:10px 0 0; display:flex; align-items:center; gap:14px;
-   justify-content:center; border-radius:14px; border:2px solid #27272a;
-   background:rgba(255,255,255,.02); padding:12px 18px;
-   color:#a1a1aa; font-weight:900; letter-spacing:.08em; text-transform:uppercase;
-   font-size:clamp(1.1rem,3.5vw,2.5rem); line-height:1; }}
- .prujezd .svetlo {{ width:1em; height:1em; border-radius:50%; background:#3f3f46;
-   flex-shrink:0; }}
- .prujezd.zije {{ color:#fff; border-color:#fff; background:#dc2626;
-   box-shadow:0 0 34px rgba(239,68,68,.85); }}
- .prujezd.zije .svetlo {{ background:#ef4444; box-shadow:0 0 18px rgba(239,68,68,1);
-   animation:prujezd-puls .8s ease-in-out infinite; }}
- .prujezd small {{ font-size:.48em; letter-spacing:.04em; opacity:.95; }}
- @keyframes prujezd-puls {{ 50% {{ transform:scale(1.22); }} }}
- .tokenblok {{ padding-top:14px; }}
- .tokenramecek {{ margin-top:10px; border-radius:16px; border:2px solid rgba(132,204,22,.8);
-                  padding:14px 18px; text-align:center;
-                  background-image: radial-gradient(rgba(87,255,36,.16) 1px, transparent 1px);
-                  background-size:7px 7px; }}
- code {{ display:block; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-weight:700;
-         letter-spacing:.09em; color:#84cc16; text-shadow:0 0 8px rgba(80,255,30,.25);
-         font-size:clamp(1.5rem, 5vw, 3.4rem); }}
- .paticka {{ margin-top:14px; display:flex; align-items:center; justify-content:center; gap:8px;
-             color:#a1a1aa; font-size:clamp(.7rem,1.7vw,1rem); }}
- .paticka a {{ color:#a1a1aa; }}
- .novytoken {{ margin:10px 0 0; text-align:center; }}
- .tlacitko {{ border:1px solid #3f3f46; background:#18181b; color:#a1a1aa; border-radius:12px;
-              padding:10px 22px; font-family:inherit; font-weight:700; letter-spacing:.08em;
-              text-transform:uppercase; font-size:clamp(.8rem,1.8vw,1.05rem); }}
- .tlacitko.pozor {{ border-color:#ef4444; color:#fca5a5; background:rgba(239,68,68,.12); }}
+           font-size:clamp(2.5rem, 8vw, 6.5rem); }}
+ .detail {{ margin:10px 0 0; color:#a1a1aa; font-size:clamp(.7rem,1.6vw,1rem);
+            text-align:center; }}
+
+ /* Tlačítko tokenu vypadá jako karta — na dotykovém displeji je to půlka
+    obrazovky, ne malý knoflík. Odjištěné je červené a říká, co se stane. */
+ .karta-tlacitko {{ border-color:#84cc16; background:rgba(132,204,22,.1); cursor:pointer;
+                    font-family:inherit; color:#fff; text-align:center; transition:background .15s; }}
+ .karta-tlacitko:hover {{ background:rgba(132,204,22,.2); }}
+ .karta-tlacitko .ikona {{ color:#a3e635; line-height:1; font-size:clamp(2.5rem,6vw,4.5rem); }}
+ .karta-tlacitko .nadpis {{ margin-top:4px; font-weight:900; letter-spacing:.03em;
+                            color:#bef264; font-size:clamp(1.1rem,3vw,2.2rem); }}
+ .karta-tlacitko.pozor {{ border-color:#ef4444; background:rgba(239,68,68,.14); }}
+ .karta-tlacitko.pozor .ikona,
+ .karta-tlacitko.pozor .nadpis {{ color:#fca5a5; }}
+
+ /* Cesta průjezdu: smyčka → server. Dvě diody, mezi nimi šipka. */
+ .cesta {{ display:grid; grid-template-columns:1fr auto 1fr; align-items:center; gap:12px; }}
+ .cesta .sipka {{ font-weight:900; color:#d4d4d8; font-size:clamp(2rem,5vw,4rem); }}
+ .uzel {{ border-radius:20px; border:1px solid #84cc16; padding:16px; display:flex;
+          align-items:center; gap:16px; min-height:105px; }}
+ .uzel.server {{ border-color:#0ea5e9; }}
+ .uzel .nazev {{ font-weight:900; text-transform:uppercase; letter-spacing:.1em;
+                 font-size:clamp(.85rem,2vw,1.2rem); }}
+ .uzel .hodnota {{ font-weight:900; color:#71717a; font-size:clamp(1rem,2.3vw,1.5rem); }}
+ .uzel .hodnota.zeleno {{ color:#a3e635; }}
+ .uzel .hodnota.modro {{ color:#38bdf8; }}
+ .uzel .hodnota.oranzovo {{ color:#fbbf24; }}
+ .uzel .pod {{ color:#a1a1aa; font-size:clamp(.65rem,1.4vw,.9rem); }}
+ .dioda {{ width:28px; height:28px; border-radius:9999px; background:#24272a;
+           border:2px solid #4b5563; flex:0 0 auto; transition:all .15s ease; }}
+ .dioda.zelena {{ background:#67ff19; border-color:#c0ff9f;
+   box-shadow:0 0 8px rgba(103,255,25,.95), 0 0 20px rgba(103,255,25,.8),
+              0 0 34px rgba(103,255,25,.45); }}
+ .dioda.modra {{ background:#28b7ff; border-color:#8fddff;
+   box-shadow:0 0 8px rgba(40,183,255,.95), 0 0 20px rgba(40,183,255,.8),
+              0 0 34px rgba(40,183,255,.45); }}
+ .dioda.blik {{ animation:blik .5s ease-out; }}
+ @keyframes blik {{
+   0% {{ transform:scale(1); }}
+   20% {{ transform:scale(1.45); filter:brightness(1.8); }}
+   100% {{ transform:scale(1); }}
+ }}
+
+ /* Token: rámeček s tečkovaným rastrem a nadpisem posazeným do hrany. */
+ .tokenblok {{ position:relative; border-radius:18px; border:2px solid #84cc16;
+               padding:16px 20px;
+               background-image: radial-gradient(rgba(98,255,30,.18) 1px, transparent 1px);
+               background-size:7px 7px; }}
+ .tokenblok .nadpis {{ position:absolute; top:-14px; left:50%; transform:translateX(-50%);
+                       background:#050607; padding:0 14px; font-weight:900;
+                       text-transform:uppercase; letter-spacing:.1em;
+                       font-size:clamp(.8rem,1.8vw,1.15rem); white-space:nowrap; }}
+ .tokenradek {{ display:flex; align-items:center; gap:16px; }}
+ .tokenradek .zamek {{ color:#a3e635; font-size:clamp(1.6rem,3.5vw,3rem); }}
+ /* Token se láme na dva řádky **po třech skupinách**, ne kdekoli: na
+    3,5" displeji se celý na řádek nevejde a zlom uprostřed skupiny by se
+    obsluze opisoval s chybou. Zlom nese text (\n) + `pre-line`. */
+ code {{ display:block; flex:1; text-align:center; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+         font-weight:900; letter-spacing:.08em; color:#a3e635; white-space:pre-line;
+         text-shadow:0 0 10px rgba(106,255,0,.5);
+         font-size:clamp(1.1rem, 3.2vw, 2.4rem); line-height:1.15; }}
+
+ /* Noha: poslední průjezd vlevo, čas obnovení vpravo. */
+ .paticka {{ margin-top:auto; padding-top:12px; border-top:1px solid #27272a;
+             display:flex; align-items:center; justify-content:space-between; gap:16px;
+             color:#d4d4d8; font-size:clamp(.65rem,1.4vw,.95rem); }}
+ .paticka strong {{ color:#fff; }}
+ .paticka .vlevo {{ display:flex; align-items:center; gap:8px; min-width:0; }}
 
  /* Malé SPI displeje (MHS35: 480×320). Spodní mez clamp() je stavěná na
     monitor — tady by token, kvůli kterému displej existuje, skončil pod
-    spodním okrajem. Nadpis a nadpisky ustoupí, token zůstává největší. */
+    spodním okrajem. Ustupuje všechno kromě tokenu a diod. */
  @media (max-height: 420px) {{
    main {{ padding:4px; }}
-   .ramecek {{ padding:5px; border-radius:14px; }}
-   .vnitrek {{ padding:4px 10px; border-radius:10px; }}
-   header {{ padding-bottom:4px; }}
-   h1 {{ font-size:1.15rem; letter-spacing:.1em; }}
-   .stav {{ padding:4px 0; }}
-   .popisek {{ font-size:.7rem; }}
-   .vysledek {{ margin-top:4px; gap:12px; }}
-   .kolecko {{ width:2.6rem; height:2.6rem; border-width:3px; font-size:1.3rem; }}
-   .slovo {{ font-size:2.1rem; }}
-   .detail {{ margin-top:4px; font-size:.62rem; }}
-   /* Malý displej (MHS35 480×320): pruh zůstává čitelný, jen se stáhne. */
-   .prujezd {{ margin-top:4px; font-size:1.15rem; gap:8px; padding:7px 8px;
-     border-radius:8px; border-width:2px; }}
-   .tokenblok {{ padding-top:5px; }}
-   .tokenramecek {{ margin-top:4px; padding:6px 8px; border-radius:10px; }}
-   code {{ font-size:2.3rem; letter-spacing:.03em; }}
-   .paticka {{ margin-top:5px; font-size:.58rem; }}
-   .novytoken {{ margin-top:4px; }}
-   .tlacitko {{ padding:6px 14px; border-radius:8px; font-size:.62rem; }}
+   .ramecek {{ padding:6px; border-radius:14px; gap:6px; }}
+   header {{ padding-bottom:4px; border-bottom-width:1px; }}
+   h1 {{ font-size:1.25rem; letter-spacing:.08em; }}
+   .hodiny .cas {{ font-size:1rem; }}
+   .hodiny .datum {{ font-size:.58rem; margin-top:1px; }}
+   .dvojice {{ gap:6px; }}
+   .karta {{ min-height:0; padding:6px; border-radius:12px; border-width:1px; }}
+   .karta .popisek {{ font-size:.6rem; }}
+   .vysledek {{ margin-top:4px; gap:8px; }}
+   .kolecko {{ width:2rem; height:2rem; border-width:2px; font-size:1rem; }}
+   .slovo {{ font-size:1.7rem; }}
+   .detail {{ display:none; }}
+   .karta-tlacitko .ikona {{ font-size:1.5rem; }}
+   .karta-tlacitko .nadpis {{ font-size:.72rem; margin-top:0; }}
+   .cesta {{ gap:6px; }}
+   .cesta .sipka {{ font-size:1.2rem; }}
+   .uzel {{ min-height:0; padding:6px 8px; gap:8px; border-radius:12px; }}
+   .uzel .nazev {{ font-size:.55rem; letter-spacing:.06em; }}
+   .uzel .hodnota {{ font-size:.72rem; }}
+   .uzel .pod {{ display:none; }}
+   .dioda {{ width:16px; height:16px; }}
+   /* Token dostane zbylé místo: na 3,5" displeji je to ta věc, kvůli které
+      se na obrazovku kouká, a prázdná plocha pod ním by byla plýtvání. */
+   .tokenblok {{ padding:8px 10px; border-radius:12px; flex:1;
+     display:flex; align-items:center; }}
+   .tokenblok .tokenradek {{ flex:1; }}
+   .tokenblok .nadpis {{ top:-9px; font-size:.55rem; padding:0 8px; }}
+   .tokenradek {{ gap:8px; }}
+   .tokenradek .zamek {{ font-size:1rem; }}
+   code {{ font-size:1.45rem; letter-spacing:.02em; }}
+   .paticka {{ padding-top:5px; font-size:.55rem; }}
  }}
 """
 
+#: Displej se **neobnovuje celou stránkou**. Návrh Ri5 v2 má živé hodiny
+#: a diody, které bliknou na průjezd; při `meta refresh` po sekundě by
+#: animace nikdy nedoběhla a obrazovka by problikávala. Stav se proto tahá
+#: z `/stav` (JSON) a mění se jen to, co se změnilo.
 _SCREEN = """<!doctype html>
 <html lang="cs"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{nadpis}</title>
 <style>{styl}</style>
-<meta http-equiv="refresh" content="1">
 </head>
-<body><main><section class="ramecek"><div class="vnitrek">
- <header><h1>BIKODY<span class="tecka">.</span>COM</h1></header>
+<body><main><section class="ramecek">
 
- <section class="stav">
-  <p class="popisek">Stav serveru:</p>
-  <div class="vysledek">
-   <div class="kolecko">{znak}</div>
-   <div class="slovo">{slovo}</div>
+ <header>
+  <h1>BIKODY<span class="tecka">.</span>COM</h1>
+  <div class="hodiny">
+   <div class="cas" id="cas">{cas_hodiny}</div>
+   <div class="datum" id="datum">{cas_datum}</div>
   </div>
-  <p class="detail">{detail}</p>
-  {prujezd}
+ </header>
+
+ <section class="dvojice">
+  <div class="karta">
+   <p class="popisek">Stav serveru</p>
+   <div class="vysledek">
+    <div class="kolecko" id="znak">{znak}</div>
+    <div class="slovo" id="slovo">{slovo}</div>
+   </div>
+   <p class="detail" id="detail">{detail}</p>
+  </div>
+  {tlacitko}
+ </section>
+
+ <section class="cesta">
+  <div class="uzel">
+   <span class="{dioda_smycka}" id="dioda-smycka"></span>
+   <div>
+    <div class="nazev">Smyčka</div>
+    <div class="{trida_smycka}" id="text-smycka">{text_smycka}</div>
+    <div class="pod">PŘÍJEM ZE SMYČKY</div>
+   </div>
+  </div>
+  <div class="sipka">&rarr;</div>
+  <div class="uzel server">
+   <span class="{dioda_server}" id="dioda-server"></span>
+   <div>
+    <div class="nazev">Server</div>
+    <div class="{trida_server}" id="text-server">{text_server}</div>
+    <div class="pod">DATA PŘEDÁNA SERVERU</div>
+   </div>
+  </div>
  </section>
 
  <section class="tokenblok">
-  <p class="popisek" style="text-align:center">{token_popisek}</p>
-  <div class="tokenramecek"><code>{token}</code></div>
-  {tlacitko}
-  <p class="paticka">AKTUALIZOVÁNO: {cas}</p>
+  <div class="nadpis">{token_popisek}</div>
+  <div class="tokenradek">
+   <div class="zamek">&#128274;</div>
+   <code id="token">{token}</code>
+  </div>
  </section>
-</div></section></main></body></html>"""
+
+ <footer class="paticka">
+  <span class="vlevo">&#8635;&nbsp;POSLEDNÍ PRŮJEZD: <strong id="posledni">{posledni}</strong></span>
+  <span>AKTUALIZOVÁNO: <strong id="aktualizovano">{cas}</strong></span>
+ </footer>
+
+</section></main>
+<script>
+// Živý displej: hodiny tikají v prohlížeči, ostatní se tahá z /stav.
+// Celá stránka se neobnovuje — animace diod by při obnovení po sekundě
+// nikdy nedoběhla a token by problikával.
+(function () {{
+  "use strict";
+  var LED_MS = 2200;
+
+  function dvojmistne(cislo) {{ return (cislo < 10 ? "0" : "") + cislo; }}
+
+  function tik() {{
+    var now = new Date();
+    var cas = dvojmistne(now.getHours()) + ":" + dvojmistne(now.getMinutes())
+            + ":" + dvojmistne(now.getSeconds());
+    var datum = dvojmistne(now.getDate()) + "." + dvojmistne(now.getMonth() + 1)
+              + "." + now.getFullYear();
+    document.getElementById("cas").textContent = cas;
+    document.getElementById("datum").textContent = datum;
+    return datum + " " + cas;
+  }}
+
+  var stav = {{ smycka: false, server: false }};
+
+  function dioda(id, trida, sviti) {{
+    var el = document.getElementById(id);
+    if (!el) return;
+    var chtene = sviti ? "dioda " + trida : "dioda";
+    if (el.className.indexOf(trida) === -1 && sviti) chtene += " blik";
+    el.className = chtene;
+  }}
+
+  function napis(id, text, trida) {{
+    var el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = text;
+    el.className = "hodnota" + (trida ? " " + trida : "");
+  }}
+
+  function nakresli(data) {{
+    dioda("dioda-smycka", "zelena", data.smycka);
+    dioda("dioda-server", "modra", data.server);
+    napis("text-smycka", data.smycka ? "SIGNÁL PŘIJAT" : "ČEKÁM NA PRŮJEZD",
+          data.smycka ? "zeleno" : "");
+    if (data.server) napis("text-server", "ODESLÁNO", "modro");
+    else if (data.smycka) napis("text-server", "ODESÍLÁM…", "oranzovo");
+    else napis("text-server", "PŘIPRAVEN", "");
+
+    document.getElementById("posledni").textContent = data.posledni || "--:--:--";
+    document.getElementById("znak").textContent = data.znak;
+    document.getElementById("slovo").textContent = data.slovo;
+    document.getElementById("detail").textContent = data.detail;
+    document.getElementById("token").textContent = data.token;
+    document.getElementById("aktualizovano").textContent = tik();
+
+    // Barva stavu serveru se mění podle toho stavu, takže ji nese odpověď
+    // `/stav`, ne jen styl vygenerovaný při prvním načtení stránky.
+    document.querySelectorAll(".karta:first-child .kolecko, .karta:first-child .slovo")
+      .forEach(function (el) {{ el.style.color = data.barva; }});
+    var kolecko = document.querySelector(".karta:first-child .kolecko");
+    if (kolecko) kolecko.style.borderColor = data.barva;
+    var karta = document.querySelector(".karta:first-child");
+    if (karta) karta.style.borderColor = data.barva;
+
+    var tlacitko = document.getElementById("token-tlacitko");
+    if (tlacitko) {{
+      tlacitko.className = "karta karta-tlacitko" + (data.odjisteno ? " pozor" : "");
+      var nadpis = tlacitko.querySelector(".nadpis");
+      if (nadpis) {{
+        nadpis.textContent = data.odjisteno
+          ? "KLEPNĚTE ZNOVU — STARÝ TOKEN PŘESTANE PLATIT"
+          : "NOVÝ TOKEN";
+      }}
+    }}
+  }}
+
+  function ptej() {{
+    fetch("/stav", {{ cache: "no-store" }})
+      .then(function (r) {{ return r.ok ? r.json() : null; }})
+      .then(function (data) {{ if (data) nakresli(data); }})
+      .catch(function () {{}});
+  }}
+
+  tik();
+  window.setInterval(tik, 1000);
+  ptej();
+  window.setInterval(ptej, 1000);
+}})();
+</script>
+</body></html>"""
 
 _SETTINGS = """<!doctype html>
 <html lang="cs"><head><meta charset="utf-8">
@@ -1250,18 +1468,22 @@ def _screen_state(worker, config: dict) -> dict:
     }
 
 
-def _token_html(token: str) -> str:
+def _token_text(token: str) -> str:
     """Token na displeji: dva řádky po třech čtveřicích.
 
     Na jednom řádku se 24 znaků na 3,5" displej nevejde čitelně; na dvou
     unese písmo skoro dvojnásobný stupeň. Zkrácený tvar spárované krabičky
     (AKUW-…-7G59) i pomlčkami nedělený text zůstávají na jednom řádku.
+
+    Zlom je **obyčejný „\n"**, ne `<br>`: obrazovka si stav tahá JSONem
+    a text sází přes `textContent`, kde by značka byla vidět jako text.
+    Zalomení kreslí CSS (`white-space: pre-line`).
     """
     groups = token.split("-")
     if len(groups) < 4:
         return token
     half = (len(groups) + 1) // 2
-    return "-".join(groups[:half]) + "<br>" + "-".join(groups[half:])
+    return "-".join(groups[:half]) + "\n" + "-".join(groups[half:])
 
 
 def _novy_token_odjisten() -> bool:
@@ -1269,59 +1491,92 @@ def _novy_token_odjisten() -> bool:
 
 
 def _tlacitko_html() -> str:
-    """Tlačítko „Nový token" — displej je dotykový, ale ruka u trati taky.
+    """Tlačítko „Nový token" — v návrhu Ri5 v2 je to celá polovina obrazovky.
 
-    Odjištěný stav je červený a říká, co se stane; obrazovka se každých pět
-    sekund obnovuje, takže po uplynutí lhůty se tlačítko samo vrátí do klidu.
+    **Jištění dvěma klepnutími zůstává.** Návrh má jedno tlačítko, ale nový
+    token okamžitě odpojí krabičku od aplikace a obsluha ho má opsaný —
+    náhodný dotek na displeji u trati by závod odstřihl od časomíry. První
+    klepnutí proto tlačítko zčervená a řekne, co se stane; druhé ve lhůtě
+    token vydá. Po jejím uplynutí se samo vrátí do klidu (displej se ptá
+    na `/stav` každou sekundu).
     """
-    if _novy_token_odjisten():
-        return (
-            '<form method="post" action="/novy-token" class="novytoken">'
-            '<button type="submit" class="tlacitko pozor">'
-            "Klepněte znovu — starý token přestane platit</button></form>"
-        )
+    odjisteno = _novy_token_odjisten()
+    trida = "karta karta-tlacitko pozor" if odjisteno else "karta karta-tlacitko"
+    nadpis = (
+        "KLEPNĚTE ZNOVU — STARÝ TOKEN PŘESTANE PLATIT" if odjisteno else "NOVÝ TOKEN"
+    )
     return (
-        '<form method="post" action="/novy-token" class="novytoken">'
-        '<button type="submit" class="tlacitko">Nový token</button></form>'
+        '<form method="post" action="/novy-token" style="display:contents">'
+        f'<button type="submit" id="token-tlacitko" class="{trida}">'
+        '<span class="ikona">&#8635;</span>'
+        f'<span class="nadpis">{nadpis}</span>'
+        "</button></form>"
     )
 
 
-def _prujezd_html() -> str:
-    """Kontrolka průjezdu pod stavem serveru.
+def _stav_json(worker, config: dict) -> bytes:
+    """Stav displeje jako JSON — z něj si obrazovka bere všechno živé.
 
-    Ukazuje se, až když nějaký průjezd dojel — do té doby by šedé „0" jen
-    mátlo vedle token flow. Červeně pulsuje ~10 s po posledním vzatém
-    průjezdu, pak zšedne a zůstane počet za běh agenta.
+    Displej se **neobnovuje celou stránkou** (návrh Ri5 v2 má tikající hodiny
+    a diody, které bliknou na průjezd; obnovení po sekundě by animaci nikdy
+    nenechalo doběhnout). Odpovídá se proto malým JSONem a mění se jen to,
+    co se opravdu změnilo.
     """
-    stav = _prujezdy_stav()
-    if not stav["celkem"]:
-        return ""
-    if stav["cerstvy"]:
-        return (
-            '<p class="prujezd zije"><span class="svetlo"></span>'
-            f'✓ PRŮJEZD ZAZNAMENÁN · {stav["celkem"]} '
-            f'<small>{stav["naposledy"]}</small></p>'
-        )
-    return (
-        '<p class="prujezd"><span class="svetlo"></span>'
-        f'průjezdy: {stav["celkem"]}</p>'
-    )
+    import json
+
+    state = _screen_state(worker, config)
+    prujezdy = _prujezdy_stav()
+    return json.dumps(
+        {
+            "barva": state["barva"],
+            "znak": state["znak"],
+            "slovo": state["slovo"],
+            "detail": state["detail"],
+            "token": _token_text(state["token"]),
+            "token_popisek": state["token_popisek"],
+            "smycka": prujezdy["smycka"],
+            "server": prujezdy["server"],
+            "celkem": prujezdy["celkem"],
+            "posledni": prujezdy["naposledy"],
+            "odjisteno": _novy_token_odjisten(),
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
 
 
 def _render_screen(worker, config: dict) -> bytes:
     state = _screen_state(worker, config)
     style = _STYLE.format(barva=state["barva"], zare=state["zare"])
+    prujezdy = _prujezdy_stav()
+    now = time.localtime()
     page = _SCREEN.format(
         nadpis="BIKODY.COM — krabička u trati",
         styl=style,
+        # První vykreslení nese stav diod samo: než dojde první odpověď
+        # `/stav`, byla by obrazovka po restartu kiosku vždycky tmavá —
+        # i uprostřed závodu, kdy průjezdy chodí.
+        dioda_smycka="dioda zelena" if prujezdy["smycka"] else "dioda",
+        dioda_server="dioda modra" if prujezdy["server"] else "dioda",
+        text_smycka="SIGNÁL PŘIJAT" if prujezdy["smycka"] else "ČEKÁM NA PRŮJEZD",
+        trida_smycka="hodnota zeleno" if prujezdy["smycka"] else "hodnota",
+        text_server=(
+            "ODESLÁNO" if prujezdy["server"]
+            else ("ODESÍLÁM…" if prujezdy["smycka"] else "PŘIPRAVEN")
+        ),
+        trida_server=(
+            "hodnota modro" if prujezdy["server"]
+            else ("hodnota oranzovo" if prujezdy["smycka"] else "hodnota")
+        ),
         znak=state["znak"],
         slovo=state["slovo"],
         detail=state["detail"],
-        prujezd=_prujezd_html(),
         token_popisek=state["token_popisek"],
-        token=_token_html(state["token"]),
+        token=_token_text(state["token"]),
         tlacitko=_tlacitko_html(),
-        cas=time.strftime("%d.%m.%Y %H:%M:%S"),
+        posledni=prujezdy["naposledy"] or "--:--:--",
+        cas=time.strftime("%d.%m.%Y %H:%M:%S", now),
+        cas_hodiny=time.strftime("%H:%M:%S", now),
+        cas_datum=time.strftime("%d.%m.%Y", now),
     )
     return page.encode("utf-8")
 
@@ -1391,9 +1646,14 @@ def build_web_server(state: dict, *, host: str, port: int):
 
         def _send(self, body: bytes, status: int = 200, headers=()):
             self.send_response(status)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            # Content-Type se posílá **jednou**: `/stav` vrací JSON a dvě
+            # hlavičky se stejným jménem by prohlížeč vyhodnotil podle první,
+            # tedy jako HTML.
+            hlavicky = list(headers)
+            if not any(name.lower() == "content-type" for name, _ in hlavicky):
+                hlavicky.insert(0, ("Content-Type", "text/html; charset=utf-8"))
             self.send_header("Content-Length", str(len(body)))
-            for name, value in headers:
+            for name, value in hlavicky:
                 self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
@@ -1402,6 +1662,17 @@ def build_web_server(state: dict, *, host: str, port: int):
             config = load_config()
             if self.path.startswith("/nastaveni"):
                 self._send(_render_settings(state.get("worker"), config))
+                return
+            if self.path.startswith("/stav"):
+                # Živý stav displeje. Bez cache: obrazovka se ptá po sekundě
+                # a kiosk prohlížeč by jinak servíroval první odpověď pořád.
+                self._send(
+                    _stav_json(state.get("worker"), config),
+                    headers=[
+                        ("Content-Type", "application/json; charset=utf-8"),
+                        ("Cache-Control", "no-store"),
+                    ],
+                )
                 return
             self._send(_render_screen(state.get("worker"), config))
 

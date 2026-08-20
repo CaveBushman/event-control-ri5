@@ -148,6 +148,34 @@ Tři stavy, které displej ukazuje:
 Když krabička neběží, aplikace se chová jako dřív a spojení zkouší navázat
 sama — u trati to nefunguje, ale nic se nerozbije.
 
+## Displej krabičky
+
+Vzhled podle návrhu `bikody_ri5_v2.html` (David, 20. 8. 2026): značka a hodiny
+v hlavičce, dvě karty na polovinu (stav serveru a tlačítko **NOVÝ TOKEN**),
+cesta průjezdu **smyčka → server** se dvěma diodami, token v rámečku
+s rastrem a v nohou poslední průjezd s časem obnovení.
+
+Tři věci, ve kterých se implementace od návrhu **záměrně** liší:
+
+* **žádný Tailwind z CDN.** Krabička u trati bývá bez internetu a stránka
+  z CDN by se jí nenačetla vůbec; třídy návrhu jsou přepsané do vlastního CSS
+  a rozměry drží `clamp()` stejně jako v návrhu — obrazovka sedne na monitor
+  i na 3,5" SPI displej (480×320).
+* **token se spárované krabičce nezobrazuje celý** (jen `F4D8-…-TR7Q`).
+  Do schválení je to jediné, proč se na displej dívat; potom je to klíč do
+  klubové sítě vystavený celý den na obrazovce u trati.
+* **„NOVÝ TOKEN" je jištěný dvěma klepnutími.** Návrh má jedno; nový token
+  ale okamžitě odpojí krabičku od aplikace, takže první klepnutí tlačítko
+  zčervená a řekne, co se stane, a druhé ve lhůtě token vydá. Náhodný dotek
+  na displeji u trati tak závod neodstřihne od časomíry.
+
+Displej se **neobnovuje celou stránkou**: hodiny tikají v prohlížeči a stav
+(diody, stav serveru, token, poslední průjezd) se tahá z `/stav` po sekundě.
+Obnovování celé stránky by animaci diod nikdy nenechalo doběhnout.
+
+Demo tlačítko „SIMULOVAT PRŮJEZD" z návrhu v krabičce **není** — diody
+rozsvěcuje skutečný provoz: rámec z dekodéru levou, přijetí serverem pravou.
+
 ## Údržba
 
 ```bash

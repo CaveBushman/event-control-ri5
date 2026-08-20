@@ -21,7 +21,12 @@ serveru, takže obrácené pořadí by jí dalo starou verzi:
 
 ```bash
 sudo bash scripts/update.sh     # stačí; deploy.sh dělá totéž a navíc projde nastavení
+sudo bash deploy.sh             # navíc `git pull` — displej i skript se mění spolu s agentem
 ```
+
+`update.sh` mění **jen agenta** (stáhne ho ze serveru). Když se změnil
+i displej nebo samo nastavení krabičky, je potřeba `deploy.sh` — ten si
+nejdřív přitáhne čerstvý repozitář a pak projde celé nastavení.
 
 ## Během závodu
 

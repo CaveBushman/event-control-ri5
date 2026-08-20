@@ -78,7 +78,15 @@ sudo bash deploy.sh --hostname krabicka-brno \
                     --static-ip 192.168.9.10/24 --gateway 192.168.9.1
 bash deploy.sh --dry-run          # jen vypíše, co by udělal, a nic nezmění
 sudo bash deploy.sh --no-kiosk    # krabička bez displeje
+sudo bash deploy.sh --no-pull     # nesahat na git (offline, vlastní úpravy)
 ```
+
+**Deploy si nejdřív stáhne čerstvou verzi z gitu** (`git pull --ff-only`) —
+displej, agent i skript se mění spolu, takže nasazení ze staré kopie nasadí
+staré věci a na trati to nikdo nepozná. Když se něco přitáhlo a změnil se
+i `deploy.sh`, skript se spustí znovu z nové verze (bash čte soubor po
+částech, přepsat běžící skript uprostřed běhu je past). Místní změny
+v adresáři pull přeskočí a řekne to — nic nepřepisuje pod rukama.
 
 Pouštět se dá opakovaně — je to nastavení, ne instalace. **Token se přitom
 nikdy nepřepíše**, protože ho obsluha má opsaný v aplikaci.

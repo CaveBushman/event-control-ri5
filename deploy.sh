@@ -3,19 +3,22 @@
 #
 # Jeden příkaz, žádné otázky. Co udělá:
 #
-#   1. doinstaluje, co chybí (cage, chromium, curl, avahi),
-#   2. nastaví jméno stroje a časové pásmo,
-#   3. nakopíruje agenta do /opt a zapne ho jako službu,
-#   4. zapne displej (kiosk) jako službu — bez plochy a bez přihlašování,
-#   5. zapne hardwarový watchdog a vypne zhasínání konzole,
-#   6. volitelně nastaví pevnou IP,
-#   7. na konci zkontroluje, že obojí běží, a napíše, co zbývá.
+#   1. stáhne aktuální verzi z gitu (`git pull`) — displej i agent se mění
+#      spolu se skriptem, takže deploy ze staré kopie nasadí staré věci,
+#   2. doinstaluje, co chybí (cage, chromium, curl, avahi),
+#   3. nastaví jméno stroje a časové pásmo,
+#   4. nakopíruje agenta do /opt a zapne ho jako službu,
+#   5. zapne displej (kiosk) jako službu — bez plochy a bez přihlašování,
+#   6. zapne hardwarový watchdog a vypne zhasínání konzole,
+#   7. volitelně nastaví pevnou IP,
+#   8. na konci zkontroluje, že obojí běží, a napíše, co zbývá.
 #
 # Použití:
 #
 #   sudo bash deploy.sh
 #   sudo bash deploy.sh --hostname krabicka-brno \
 #                       --static-ip 192.168.9.10/24 --gateway 192.168.9.1
+#   sudo bash deploy.sh --no-pull  # nesahat na git (offline, vlastní úpravy)
 #   bash deploy.sh --dry-run       # jen vypíše, co by udělal
 #
 # Přes `bash`, ne `./deploy.sh`: kopírování na Pi umí souboru sebrat právo
@@ -40,6 +43,7 @@ STATIC_IP=""
 GATEWAY=""
 DNS="1.1.1.1"
 WITH_KIOSK=1
+WITH_PULL=1
 DRY_RUN=0
 KIOSK_REZIM="zadny"      # plocha | systemd | zadny — podle toho, co drží obrazovku
 
@@ -57,6 +61,7 @@ while [[ $# -gt 0 ]]; do
         --gateway)    GATEWAY="${2:-}"; shift 2 ;;
         --dns)        DNS="${2:-}"; shift 2 ;;
         --no-kiosk)   WITH_KIOSK=0; shift ;;
+        --no-pull)    WITH_PULL=0; shift ;;
         --dry-run)    DRY_RUN=1; shift ;;
         -h|--help)    usage 0 ;;
         *) echo "Neznámý přepínač: $1" >&2; usage 1 ;;
@@ -106,7 +111,53 @@ DESKTOP_USER="${SUDO_USER:-${USER:-pi}}"
 echo "Event Control — nastavení krabičky u trati"
 [[ $DRY_RUN -eq 1 ]] && echo "(nanečisto — nic se nemění)"
 
-# --- 1. balíčky ------------------------------------------------------------
+# --- 1. čerstvá kopie repozitáře -------------------------------------------
+#
+# Displej, agent i tenhle skript se mění spolu, takže deploy ze staré kopie
+# nasadí staré věci — a na trati to nikdo nepozná (Davidovo zadání
+# 20. 8. 2026: „do deploy krabičky u trati dodělej git pull").
+#
+# Tři opatrnosti:
+#
+#   * `safe.directory` — repozitář patří `pi`, ale skript běží pod sudo
+#     a git by jinak odmítl „dubious ownership",
+#   * `--ff-only` — na krabičce se nevětví; kdyby se strom rozešel, je lepší
+#     to říct než vyrobit merge commit v terénu,
+#   * **restart sebe sama** — bash čte skript po částech, takže přepsat
+#     běžící `deploy.sh` uprostřed běhu je past. Když se něco přitáhlo,
+#     skript se spustí znovu z nové verze (a jen jednou, hlídá to proměnná).
+
+krok "Git"
+if [[ $WITH_PULL -eq 0 ]]; then
+    info "přeskočeno (--no-pull)"
+elif [[ ! -d "$ROOT/.git" ]]; then
+    info "tohle není git repozitář — není odkud táhnout"
+elif ! command -v git >/dev/null; then
+    varuj "git není nainstalovaný — pokračuji s tím, co je v adresáři"
+elif [[ $DRY_RUN -eq 1 ]]; then
+    printf '  \033[2m$ git -C %s pull --ff-only\033[0m\n' "$ROOT"
+else
+    GIT=(git -C "$ROOT" -c safe.directory="$ROOT")
+    PRED="$("${GIT[@]}" rev-parse HEAD 2>/dev/null || echo "")"
+    if [[ -n "$("${GIT[@]}" status --porcelain 2>/dev/null)" ]]; then
+        varuj "v adresáři jsou místní změny — git pull přeskočen"
+    elif "${GIT[@]}" pull --ff-only --quiet; then
+        PO="$("${GIT[@]}" rev-parse HEAD 2>/dev/null || echo "")"
+        if [[ -n "$PRED" && -n "$PO" && "$PRED" != "$PO" ]]; then
+            info "stáhnuto: ${PRED:0:7} → ${PO:0:7}"
+            if [[ "${EC_DEPLOY_RESTART:-0}" != "1" ]]; then
+                info "skript se změnil — pokračuji jeho novou verzí"
+                EC_DEPLOY_RESTART=1 exec bash "$ROOT/deploy.sh" "$@"
+            fi
+        else
+            info "už bylo aktuální"
+        fi
+    else
+        varuj "git pull se nepovedl (offline nebo rozejitý strom) — pokračuji"
+    fi
+fi
+
+# --- 2. balíčky ------------------------------------------------------------
 
 krok "Balíčky"
 CHYBI=()
@@ -135,7 +186,7 @@ else
     info "všechno je nainstalované"
 fi
 
-# --- 2. jméno stroje a čas -------------------------------------------------
+# --- 3. jméno stroje a čas -------------------------------------------------
 
 krok "Jméno stroje a časové pásmo"
 if [[ -n "$HOSTNAME_NEW" ]]; then

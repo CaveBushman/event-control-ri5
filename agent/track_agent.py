@@ -38,7 +38,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.2"
+VERSION = "1.3"
 
 #: Kam se agent hlásí, když mu nikdo neřekl jinak. Aplikace běží na jednom
 #: místě, takže adresu nemá co obsluha u trati vypisovat — krabička po zapnutí
@@ -369,10 +369,10 @@ STREAM_BUFFER_MAX = 256 * 1024
 #: nepočítají rámce (dekodér posílá i status), ale `stored` z odpovědi
 #: serveru — kontrolka tak svítí jen za průjezdy, které opravdu dojely.
 _prujezdy_lock = threading.Lock()
-_prujezdy = {"kdy": 0.0, "celkem": 0, "ze_serveru": None}
+_prujezdy = {"kdy": 0.0, "celkem": 0, "ze_serveru": None, "naposledy": ""}
 
-#: Jak dlouho po průjezdu kontrolka svítí. Displej se obnovuje po 5 s, takže
-#: kratší puls by mezi dvěma obnoveními zapadl.
+#: Jak dlouho po průjezdu kontrolka svítí. Displej se obnovuje po 1 s; deset
+#: sekund dává obsluze dost času potvrzení bezpečně zahlédnout.
 PRUJEZD_SVITI_S = 10.0
 
 
@@ -399,6 +399,7 @@ def _zaznamenat_pocitadlo(celkem) -> None:
         pribylo = celkem - znamy
         _prujezdy["kdy"] = time.monotonic()
         _prujezdy["celkem"] += pribylo
+        _prujezdy["naposledy"] = time.strftime("%H:%M:%S")
 
 
 def _zaznamenat_prujezdy(stored: int) -> None:
@@ -407,14 +408,23 @@ def _zaznamenat_prujezdy(stored: int) -> None:
     with _prujezdy_lock:
         _prujezdy["kdy"] = time.monotonic()
         _prujezdy["celkem"] += stored
+        _prujezdy["naposledy"] = time.strftime("%H:%M:%S")
+        # Aktivní POST rozsvítí displej okamžitě. Stejný průjezd se ale za
+        # okamžik objeví i v serverovém počítadle záložek; posuneme proto
+        # známý základ spolu s ním, aby se na displeji nezapočítal podruhé.
+        if _prujezdy["ze_serveru"] is not None:
+            _prujezdy["ze_serveru"] += stored
 
 
 def _prujezdy_stav() -> dict:
     with _prujezdy_lock:
-        kdy, celkem = _prujezdy["kdy"], _prujezdy["celkem"]
+        kdy = _prujezdy["kdy"]
+        celkem = _prujezdy["celkem"]
+        naposledy = _prujezdy["naposledy"]
     return {
         "celkem": celkem,
         "cerstvy": bool(kdy) and (time.monotonic() - kdy) < PRUJEZD_SVITI_S,
+        "naposledy": naposledy,
     }
 
 
@@ -1025,20 +1035,21 @@ _STYLE = """
  /* Kontrolka průjezdu. Na displej u trati se kouká z metru a přes rameno,
     takže to musí být PRUH přes celou šířku, ne tečka — první verze byla tak
     malá, že ji nebylo vidět (David, 20. 8. 2026). Červeně pulsuje ~10 s po
-    průjezdu (displej se obnovuje po 5 s, kratší puls by zapadl), pak zšedne
+    průjezdu (displej se obnovuje po 1 s), pak zšedne
     a drží počet za běh agenta. */
  .prujezd {{ margin:10px 0 0; display:flex; align-items:center; gap:14px;
    justify-content:center; border-radius:14px; border:2px solid #27272a;
-   background:rgba(255,255,255,.02); padding:8px 16px;
+   background:rgba(255,255,255,.02); padding:12px 18px;
    color:#a1a1aa; font-weight:900; letter-spacing:.08em; text-transform:uppercase;
-   font-size:clamp(1rem,3vw,2rem); line-height:1; }}
+   font-size:clamp(1.1rem,3.5vw,2.5rem); line-height:1; }}
  .prujezd .svetlo {{ width:1em; height:1em; border-radius:50%; background:#3f3f46;
    flex-shrink:0; }}
- .prujezd.zije {{ color:#fff; border-color:#ef4444; background:rgba(239,68,68,.18);
-   box-shadow:0 0 26px rgba(239,68,68,.45); }}
+ .prujezd.zije {{ color:#fff; border-color:#fff; background:#dc2626;
+   box-shadow:0 0 34px rgba(239,68,68,.85); }}
  .prujezd.zije .svetlo {{ background:#ef4444; box-shadow:0 0 18px rgba(239,68,68,1);
-   animation:prujezd-puls 1s ease-in-out infinite; }}
- @keyframes prujezd-puls {{ 50% {{ opacity:.3; }} }}
+   animation:prujezd-puls .8s ease-in-out infinite; }}
+ .prujezd small {{ font-size:.48em; letter-spacing:.04em; opacity:.95; }}
+ @keyframes prujezd-puls {{ 50% {{ transform:scale(1.22); }} }}
  .tokenblok {{ padding-top:14px; }}
  .tokenramecek {{ margin-top:10px; border-radius:16px; border:2px solid rgba(132,204,22,.8);
                   padding:14px 18px; text-align:center;
@@ -1072,8 +1083,8 @@ _STYLE = """
    .slovo {{ font-size:2.1rem; }}
    .detail {{ margin-top:4px; font-size:.62rem; }}
    /* Malý displej (MHS35 480×320): pruh zůstává čitelný, jen se stáhne. */
-   .prujezd {{ margin-top:4px; font-size:.95rem; gap:8px; padding:4px 8px;
-     border-radius:8px; border-width:1px; }}
+   .prujezd {{ margin-top:4px; font-size:1.15rem; gap:8px; padding:7px 8px;
+     border-radius:8px; border-width:2px; }}
    .tokenblok {{ padding-top:5px; }}
    .tokenramecek {{ margin-top:4px; padding:6px 8px; border-radius:10px; }}
    code {{ font-size:2.3rem; letter-spacing:.03em; }}
@@ -1088,7 +1099,7 @@ _SCREEN = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{nadpis}</title>
 <style>{styl}</style>
-<meta http-equiv="refresh" content="5">
+<meta http-equiv="refresh" content="1">
 </head>
 <body><main><section class="ramecek"><div class="vnitrek">
  <header><h1>BIKODY<span class="tecka">.</span>COM</h1></header>
@@ -1288,7 +1299,8 @@ def _prujezd_html() -> str:
     if stav["cerstvy"]:
         return (
             '<p class="prujezd zije"><span class="svetlo"></span>'
-            f'PRŮJEZD · {stav["celkem"]}</p>'
+            f'✓ PRŮJEZD ZAZNAMENÁN · {stav["celkem"]} '
+            f'<small>{stav["naposledy"]}</small></p>'
         )
     return (
         '<p class="prujezd"><span class="svetlo"></span>'

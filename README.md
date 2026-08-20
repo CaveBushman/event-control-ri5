@@ -141,7 +141,7 @@ Tři stavy, které displej ukazuje:
 * V horní liště aplikace svítí kontrolky **Hill**, **Finish** a **Kamera**.
 * Tlačítko **Dohledat MAC adresy** projde i z produkce.
 * **Průjezdy naskakují do Parsingu** — to je ta hlavní věc, kvůli které
-  krabička je. Agent 1.2 je aktivně posílá nejpozději po 0,3 s ticha;
+  krabička je. Agent 1.3 je aktivně posílá nejpozději po 0,3 s ticha;
   serverové dohledání od záložky je jen pojistka po výpadku. Když se nic
   neobjevuje, zkontrolujte verzi agenta, běžící měření a datum závodu.
 
@@ -161,8 +161,10 @@ Agent umí jen čtyři věci — připojit se, poslat bajty, vrátit, co přišl
 a **držet proud průjezdů**: od verze 1.1 drží spojení na dekodér sám a každý
 průjezd hned pošle do aplikace; verze 1.2 hlídá skutečný 0,3s limit odeslání
 (do verze 1.1 mohl sekundový socket timeout odeslání zdržet). Do verze 1.0
-se průjezdy jen stahovaly na dotaz
-serveru po 1,5 s a od smyčky k obrazovce to trvalo 2–4 s. Ani proud ale
+se průjezdy jen stahovaly na dotaz serveru po 1,5 s a od smyčky k obrazovce
+to trvalo 2–4 s. Verze 1.3 na displeji obnovuje výraznou červenou kontrolu
+každou sekundu, ukazuje čas posledního potvrzeného průjezdu a neopakuje stejný
+aktivně odeslaný průjezd v počítadle. Ani proud ale
 neznamená, že agent protokolu rozumí: otevírací rámce P3 (watchdog, resend od
 záložky) mu **předchystá server** v konfiguraci a on jen řeže příchozí bajty
 na rámce. Znalost protokolů (MyLaps P3, XML cílové kamery) zůstává na serveru,

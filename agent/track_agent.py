@@ -38,7 +38,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.3"
+VERSION = "1.4"
 
 #: Kam se agent hlásí, když mu nikdo neřekl jinak. Aplikace běží na jednom
 #: místě, takže adresu nemá co obsluha u trati vypisovat — krabička po zapnutí
@@ -252,6 +252,92 @@ def tcp_exchange(args: dict) -> dict:
                 raise
 
 
+def broadcast_targets() -> list[str]:
+    """Kam poslat broadcast — **na každé rozhraní, ne jen do výchozí trasy**.
+
+    `255.255.255.255` je *omezený* broadcast: jádro ho pošle jedním
+    rozhraním, které vybere podle směrovací tabulky — tedy tím, kudy vede
+    výchozí trasa. Krabička u trati bývá zapojená dvěma dráty: LTE nebo wifi
+    do internetu (a tam vede výchozí trasa) a ethernet do sítě dekodérů.
+    Dotaz tak odešel do internetu, dekodéry ho nikdy neviděly a hledání
+    vracelo prázdno, i když krabička i dekodér šlapaly (Davidův nález
+    20. 8. 2026: „krabička u trati nevyhledává IP adresy a MAC adresy
+    dekodérů, ač to má umět").
+
+    Řešení je poslat dotaz na **směrovaný broadcast každé podsítě**, kterou
+    krabička vidí (192.168.1.0/24 → 192.168.1.255): takový paket už má
+    adresáta v konkrétní síti a jádro ho pošle tím správným drátem.
+    Omezený broadcast zůstává v seznamu jako záloha pro případ, že se
+    rozhraní vypsat nedají.
+
+    Adresy se čtou z `ip -4 -o addr` (Linux — Raspberry Pi u trati) nebo
+    `ifconfig` (macOS); bez nich zbývá omezený broadcast. Žádná další
+    závislost: krabička jede na čistém Pythonu ze standardní knihovny.
+    """
+    targets: list[str] = []
+    for network, prefix in _local_networks():
+        directed = _broadcast_address(network, prefix)
+        if directed and directed not in targets:
+            targets.append(directed)
+    targets.append("255.255.255.255")
+    return targets
+
+
+def _local_networks() -> list[tuple[str, int]]:
+    """Adresy a délky prefixů IPv4 rozhraní — kromě loopbacku."""
+    networks: list[tuple[str, int]] = []
+    for command in (["ip", "-4", "-o", "addr"], ["ifconfig"]):
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode != 0 or not result.stdout:
+            continue
+        networks = _parse_networks(result.stdout)
+        if networks:
+            break
+    return networks
+
+
+def _parse_networks(text: str) -> list[tuple[str, int]]:
+    """Z výpisu `ip addr` nebo `ifconfig` vytáhne (adresa, prefix).
+
+    Hledá se `a.b.c.d/len` (Linux) a `inet a.b.c.d netmask 0xffffff00`
+    (macOS). Loopback se vynechává — broadcast do sebe nikoho nenajde.
+    """
+    import re
+
+    found: list[tuple[str, int]] = []
+
+    def add(address: str, prefix: int) -> None:
+        if address.startswith("127.") or not 1 <= prefix <= 31:
+            return
+        if (address, prefix) not in found:
+            found.append((address, prefix))
+
+    for match in re.finditer(r"\b(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,2})\b", text):
+        add(match.group(1), int(match.group(2)))
+    for match in re.finditer(
+        r"inet (\d{1,3}(?:\.\d{1,3}){3}) netmask (0x[0-9a-fA-F]{8})", text
+    ):
+        add(match.group(1), bin(int(match.group(2), 16)).count("1"))
+    return found
+
+
+def _broadcast_address(address: str, prefix: int) -> str:
+    """Směrovaný broadcast podsítě: 192.168.1.7/24 → 192.168.1.255."""
+    try:
+        octets = [int(part) for part in address.split(".")]
+    except ValueError:
+        return ""
+    if len(octets) != 4 or any(not 0 <= part <= 255 for part in octets):
+        return ""
+    value = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]
+    host_bits = 32 - prefix
+    value |= (1 << host_bits) - 1
+    return ".".join(str((value >> shift) & 0xFF) for shift in (24, 16, 8, 0))
+
+
 def udp_discover(args: dict) -> dict:
     """Broadcast do místní sítě a sběr odpovědí — hledání dekodérů.
 
@@ -260,6 +346,12 @@ def udp_discover(args: dict) -> dict:
     v datovém centru ho pošle nanejvýš svým sousedům, takže „Dohledat MAC
     adresy" tam vracelo prázdno, i když všechno ostatní přes agenta prošlo
     (nález 19. 8. 2026).
+
+    Posílá se na **každé rozhraní** krabičky (`broadcast_targets`), ne jen
+    do výchozí trasy: krabička u trati je typicky dvojdomá — internet jedním
+    drátem, dekodéry druhým — a jediný `255.255.255.255` odešel tím prvním
+    (Davidův nález 20. 8. 2026). Nedosažitelná cílová adresa hledání
+    nezastaví; ostatní rozhraní se zkouší dál.
 
     Agent protokolu nerozumí — pošle hotové bajty a vrátí, co se ozvalo,
     včetně adresy odesílatele. Rozebrat rámce je věc serveru.
@@ -274,13 +366,25 @@ def udp_discover(args: dict) -> dict:
 
     replies: list[dict] = []
     seen: set[str] = set()
+    targets = broadcast_targets()
+    sent: list[str] = []
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.bind(("", reply_port))
         sock.settimeout(timeout)
-        sock.sendto(payload, ("255.255.255.255", request_port))
+        for target in targets:
+            try:
+                sock.sendto(payload, (target, request_port))
+            except OSError as exc:
+                # Jedno rozhraní bez trasy (odpojený kabel, vypnutá wifi)
+                # nesmí zastavit hledání na ostatních.
+                log(f"Broadcast na {target} neprošel: {exc}")
+                continue
+            sent.append(target)
+        if not sent:
+            return {"replies": [], "error": "Broadcast neprošel žádným rozhraním."}
 
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -302,7 +406,9 @@ def udp_discover(args: dict) -> dict:
         return {"replies": replies, "error": str(exc)}
     finally:
         sock.close()
-    return {"replies": replies}
+    # `sent` říká, kudy se hledalo — bez toho je „nikdo se neozval"
+    # nerozeznatelné od „poslalo se to špatným drátem".
+    return {"replies": replies, "sent_to": sent}
 
 
 ACTIONS = {

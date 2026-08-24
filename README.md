@@ -60,7 +60,10 @@ a stav se dá otevřít z notebooku v síti.
    Jeden příkaz nastaví všechno: balíčky, agenta jako službu, displej,
    watchdog i časové pásmo. Trvá to minutu a nic se neptá. **Adresa aplikace
    se nezadává** — krabička se hlásí na `bikody.com`. Vlastní server se dá
-   přidat přepínačem `--server`.
+   přidat přepínačem `--server`. Deploy současně nastaví jednoúčelový
+   `multi-user.target` a zapne obě systemd služby, takže po každém zapnutí
+   napájení naběhne agent i displej bez přihlášení. Pokud Pi dříve startovalo
+   do plochy, změna se projeví po prvním restartu.
 
    *Proč `bash` a ne `./deploy.sh`: kopírování na Pi umí sebrat souboru právo
    ke spuštění (scp, rozbalený archiv, klon s vypnutým `core.fileMode`) a
@@ -92,13 +95,14 @@ Pouštět se dá opakovaně — je to nastavení, ne instalace. **Token se přit
 nikdy nepřepíše**, protože ho obsluha má opsaný v aplikaci.
 
 Token vyrábí krabička, ne aplikace: na dotykovém displeji se nic nepíše,
-opisuje se tam, kde je klávesnice. **Přihlášená krabička token schová** —
-zůstane z něj jen začátek a konec, protože klíč do klubové sítě nemá viset
-celý den na obrazovce u trati. Celý je v jejím nastavení.
+opisuje se tam, kde je klávesnice. **Celý token zůstává čitelný i po
+přihlášení** — na displeji 480×320 je ve dvou řádcích a skupiny se nelámou.
+Krabička proto patří do důvěryhodné místní sítě a fyzicky pod dohled.
 
 ## Co se stane po zapnutí zdroje
 
-Nic se nespouští ručně a nikdo se nikam nepřihlašuje:
+Nic se nespouští ručně a nikdo se nikam nepřihlašuje. Tohle je výchozí režim,
+který `deploy.sh` vynutí i na Pi původně nainstalovaném s desktopem:
 
 1. Systemd nastartuje **agenta** (`event-control-agent`) — hlásí se aplikaci
    a přeposílá data. Běží jako systémová služba, takže na ploše nezávisí.
@@ -193,8 +197,9 @@ sudo bash scripts/update.sh                   # nová verze agenta ze serveru
 sudo systemctl restart event-control-agent    # restart
 ```
 
-Agent umí jen čtyři věci — připojit se, poslat bajty, vrátit, co přišlo,
-a **držet proud průjezdů**: od verze 1.1 drží spojení na dekodér sám a každý
+Agent drží malou sadu síťových operací — připojit se, poslat bajty, vrátit,
+co přišlo, hledat decodery a **držet proud průjezdů**: od verze 1.1 drží
+spojení na dekodér sám a každý
 průjezd hned pošle do aplikace; verze 1.2 hlídá skutečný 0,3s limit odeslání
 (do verze 1.1 mohl sekundový socket timeout odeslání zdržet). Do verze 1.0
 se průjezdy jen stahovaly na dotaz serveru po 1,5 s a od smyčky k obrazovce
@@ -234,7 +239,8 @@ přestala odpovídat.
 Token je **heslo do vaší klubové sítě**: kdo ho má, může přes krabičku otevřít
 TCP spojení kamkoliv v ní. Proto:
 
-* přihlášená krabička token na displeji nezobrazuje celý;
+* celý token je na displeji kvůli provozní čitelnosti; krabička proto nepatří
+  do veřejné wifi pro diváky ani na místo bez fyzického dohledu;
 * nastavení je v `/opt/event-control-agent/config.json` s právy `600`;
 * nový token se vyrábí jen na výslovné přání — tlačítkem **Nový token** na
   displeji (jištěné dvěma klepnutími) nebo v nastavení krabičky — a musí se

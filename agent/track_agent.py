@@ -27,6 +27,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
+import html
+import ipaddress
 import json
 import os
 import pathlib
@@ -38,7 +41,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.4"
+VERSION = "1.6"
 
 #: Kam se agent hlásí, když mu nikdo neřekl jinak. Aplikace běží na jednom
 #: místě, takže adresu nemá co obsluha u trati vypisovat — krabička po zapnutí
@@ -110,6 +113,15 @@ class Server:
             timeout=15.0,
         )
 
+    def download_agent(self) -> bytes:
+        """Stáhne novou verzi ze stejného serveru jako řídicí API."""
+        request = urllib.request.Request(
+            f"{self.base}/bmx/api/agent/download/",
+            headers={"Authorization": f"Bearer {self.token}"},
+        )
+        with urllib.request.urlopen(request, timeout=30.0) as response:
+            return response.read()
+
 
 # --- spojení na železo -----------------------------------------------------
 #
@@ -120,6 +132,33 @@ class Server:
 # slotem místo nekonečné řady.
 
 _pool: dict[tuple[str, int], socket.socket] = {}
+
+
+def _validated_target(host: str, port: int) -> tuple[str, int]:
+    """Povolí jen IP adresu v neveřejné síti a platný TCP port.
+
+    Token odemyká příkazy ze serveru do klubové sítě. Veřejné adresy,
+    multicast a link-local metadata proto nejsou legitimní cíl decoderu ani
+    kamery. Loopback zůstává kvůli lokální diagnostice a testovacímu decoderu.
+    """
+    try:
+        address = ipaddress.ip_address((host or "").strip())
+    except ValueError as exc:
+        raise ValueError("Cíl musí být číselná IP adresa v místní síti.") from exc
+    if address.version != 4 or address.is_multicast or address.is_unspecified:
+        raise ValueError("Cílová IP adresa není povolená.")
+    if address.is_link_local:
+        raise ValueError("Link-local adresa není pro decoder ani kameru povolená.")
+    private_ranges = (
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+    )
+    if not (address.is_loopback or any(address in network for network in private_ranges)):
+        raise ValueError("Krabička se smí připojit jen do místní privátní sítě.")
+    if not 1 <= int(port) <= 65535:
+        raise ValueError("Port musí být v rozsahu 1–65535.")
+    return str(address), int(port)
 
 #: Posledních pár spojení na železo. Na displeji krabičky u trati je to jediné,
 #: podle čeho obsluha pozná, jestli se dekodéry a kamera ozývají — do aplikace
@@ -187,7 +226,7 @@ def tcp_probe(args: dict) -> dict:
     neotevírá, aby se dekodéru neujídaly sloty.
     """
     timeout = float(args.get("timeout") or 2.0)
-    host, port = args["host"], int(args["port"])
+    host, port = _validated_target(args["host"], int(args["port"]))
     if (host, port) in _pool:
         return {}
     _connection(host, port, timeout)
@@ -202,7 +241,8 @@ def tcp_send(args: dict) -> dict:
     """
     timeout = float(args.get("timeout") or 2.0)
     payload = base64.b64decode(args.get("data") or "")
-    with socket.create_connection((args["host"], int(args["port"])), timeout=timeout) as sock:
+    host, port = _validated_target(args["host"], int(args["port"]))
+    with socket.create_connection((host, port), timeout=timeout) as sock:
         sock.settimeout(timeout)
         sock.sendall(payload)
     return {}
@@ -220,7 +260,7 @@ def tcp_exchange(args: dict) -> dict:
     timeout = float(args.get("timeout") or 3.0)
     quiet = float(args.get("quiet") or 0.3)
     payload = base64.b64decode(args.get("data") or "")
-    host, port = args["host"], int(args["port"])
+    host, port = _validated_target(args["host"], int(args["port"]))
 
     for attempt in (1, 2):
         sock = _connection(host, port, timeout)
@@ -399,7 +439,13 @@ def udp_discover(args: dict) -> dict:
             if host in seen:
                 continue
             seen.add(host)
-            replies.append({"host": host, "data": base64.b64encode(data).decode("ascii")})
+            replies.append(
+                {
+                    "host": host,
+                    "data": base64.b64encode(data).decode("ascii"),
+                    "mac_address": _neighbor_mac(host),
+                }
+            )
     except OSError as exc:
         # Port 5303 může držet jiný program (MyLaps Toolkit, druhá instance).
         # Hledání se pak nekoná, ale agent kvůli tomu nepadá.
@@ -411,11 +457,68 @@ def udp_discover(args: dict) -> dict:
     return {"replies": replies, "sent_to": sent}
 
 
+def _neighbor_mac(host: str) -> str:
+    """Plná L2 MAC z ARP/neighbor tabulky, pokud ji operační systém zná."""
+    import re
+
+    commands = (["ip", "neigh", "show", host], ["arp", "-n", host])
+    pattern = re.compile(r"\b(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b")
+    for command in commands:
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        match = pattern.search(result.stdout or "")
+        if match:
+            return match.group(0).upper()
+    return ""
+
+
+def clock_info(_args: dict) -> dict:
+    """Hodiny počítače u trati pro porovnání se serverem a decoderem."""
+    import datetime as dt
+
+    now = time.time()
+    return {
+        "unix_ms": round(now * 1000),
+        "utc": dt.datetime.fromtimestamp(now, tz=dt.timezone.utc).isoformat(),
+        "local": dt.datetime.fromtimestamp(now).astimezone().isoformat(),
+    }
+
+
+def network_info(_args: dict) -> dict:
+    """Nedestruktivní diagnostika rozhraní, broadcastů a UDP odpovědního portu."""
+    networks = _local_networks()
+    port_ok = False
+    port_error = ""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", 5303))
+        port_ok = True
+    except OSError as exc:
+        port_error = str(exc)
+    finally:
+        sock.close()
+    return {
+        "interfaces": [
+            {"address": address, "prefix": prefix}
+            for address, prefix in networks
+        ],
+        "broadcasts": broadcast_targets(),
+        "reply_port_ok": port_ok,
+        "reply_port_error": port_error,
+        **clock_info({}),
+    }
+
+
 ACTIONS = {
     "tcp_probe": tcp_probe,
     "tcp_send": tcp_send,
     "tcp_exchange": tcp_exchange,
     "udp_discover": udp_discover,
+    "clock_info": clock_info,
+    "network_info": network_info,
 }
 
 
@@ -425,7 +528,11 @@ def run_command(server: Server, command: dict) -> None:
         server.result(command.get("id"), False, error=f"Neznámý příkaz {command.get('action')!r}.")
         return
     args = command.get("args") or {}
-    host, port = str(args.get("host", "")), int(args.get("port") or 0)
+    host = str(args.get("host", ""))
+    try:
+        port = int(args.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
     try:
         data = action(args)
     except (OSError, TimeoutError, ValueError) as exc:
@@ -457,7 +564,7 @@ STREAM_EOR = 0x8F
 #: Průjezdy se posílají po skupinkách: osm jezdců projede cílem ve zlomku
 #: sekundy a POST na každý zvlášť by byl osminásobný provoz. Delší čekání by
 #: zdržovalo obrazovku, takže jen okamžik.
-STREAM_QUIET_SECONDS = 0.3
+STREAM_QUIET_SECONDS = 0.1
 STREAM_MAX_FRAMES = 50
 
 #: Kolik rámců smí čekat na odeslání, když server zrovna nebere. Víc znamená
@@ -627,6 +734,13 @@ class StreamLink:
         backoff = RECONNECT_MIN
         backlog: list[str] = []
 
+        try:
+            host, port = _validated_target(host, port)
+        except ValueError as exc:
+            _remember(host, port, False, str(exc))
+            log(f"Proud {host}:{port} odmítnut: {exc}")
+            return
+
         while not self._stop.is_set():
             try:
                 with socket.create_connection((host, port), timeout=3.0) as sock:
@@ -719,6 +833,8 @@ class Worker:
         self._thread: threading.Thread | None = None
         self.connected = False
         self.status = "nespuštěno"
+        self.latest_version = VERSION
+        self.latest_sha256 = ""
         #: id smyčky -> běžící proud průjezdů (StreamLink)
         self._streams: dict[str, StreamLink] = {}
 
@@ -792,6 +908,8 @@ class Worker:
                 if not greeted:
                     hello = self.server.hello()
                     greeted = True
+                    self.latest_version = str(hello.get("latest_version") or VERSION)
+                    self.latest_sha256 = str(hello.get("agent_sha256") or "")
                     name = hello.get("agent")
                     organization = hello.get("organization")
                     self._set(f"připojen jako {name} ({organization})", connected=True)
@@ -1249,6 +1367,7 @@ _STYLE = """
              display:flex; align-items:center; justify-content:space-between; gap:16px;
              color:#d4d4d8; font-size:clamp(.65rem,1.4vw,.95rem); }}
  .paticka strong {{ color:#fff; }}
+ .paticka a {{ color:#93c5fd; font-weight:900; text-decoration:none; }}
  .paticka .vlevo {{ display:flex; align-items:center; gap:8px; min-width:0; }}
 
  /* Malé SPI displeje (MHS35: 480×320). Spodní mez clamp() je stavěná na
@@ -1286,7 +1405,7 @@ _STYLE = """
    .tokenradek {{ gap:8px; }}
    .tokenradek .zamek {{ font-size:1rem; }}
    code {{ font-size:1.45rem; letter-spacing:.02em; }}
-   .paticka {{ padding-top:5px; font-size:.55rem; }}
+   .paticka {{ padding-top:5px; font-size:.55rem; gap:6px; }}
  }}
 """
 
@@ -1352,7 +1471,8 @@ _SCREEN = """<!doctype html>
 
  <footer class="paticka">
   <span class="vlevo">&#8635;&nbsp;POSLEDNÍ PRŮJEZD: <strong id="posledni">{posledni}</strong></span>
-  <span>AKTUALIZOVÁNO: <strong id="aktualizovano">{cas}</strong></span>
+  <span>AGENT <strong id="verze">{verze}</strong></span>
+  <a href="/nastaveni">NASTAVENÍ</a>
  </footer>
 
 </section></main>
@@ -1408,7 +1528,8 @@ _SCREEN = """<!doctype html>
     document.getElementById("slovo").textContent = data.slovo;
     document.getElementById("detail").textContent = data.detail;
     document.getElementById("token").textContent = data.token;
-    document.getElementById("aktualizovano").textContent = tik();
+    document.getElementById("verze").textContent = data.verze;
+    tik();
 
     // Barva stavu serveru se mění podle toho stavu, takže ji nese odpověď
     // `/stav`, ne jen styl vygenerovaný při prvním načtení stránky.
@@ -1470,6 +1591,9 @@ _SETTINGS = """<!doctype html>
  td {{ padding:6px 0; border-top:1px solid #1e2a36; color:#c9d5e1; }}
  td.stavbunka {{ color:#3fb950; }} td.stavbunka.chyba {{ color:#f85149; }}
  a {{ color:#2f81f7; }}
+ .panel {{ margin-top:20px; padding:14px; border:1px solid #1e2a36; border-radius:12px;
+           background:#0d141b; font-size:13px; line-height:1.55; }}
+ .panel strong {{ color:#fff; }} .ok {{ color:#3fb950; }} .chyba {{ color:#f85149; }}
 </style></head>
 <body><main>
  <h1>Agent u trati — nastavení</h1>
@@ -1488,11 +1612,23 @@ _SETTINGS = """<!doctype html>
    <label for="novytoken" style="margin:0;text-transform:none;letter-spacing:0;font-size:14px">
      Vyrobit nový token (starý přestane platit)</label>
   </div>
-  <button type="submit">Uložit</button>
+ <button type="submit">Uložit</button>
  </form>
  <p class="hint">Token krabičky: <code>{token}</code><br>
    Opište ho v aplikaci do <strong>Nastavení aplikace → Přihlásit krabičku</strong>.
    Uložený je v <code>{config}</code>.</p>
+
+ <h1 style="font-size:15px;margin-top:28px">Diagnostika krabičky</h1>
+ <p class="hint" style="margin-top:4px">Bez mazání dat ověří rozhraní,
+   broadcast adresy, port odpovědí decoderů a hodiny počítače.</p>
+ <form method="post" action="/diagnostika"><button type="submit">Spustit diagnostiku</button></form>
+ {diagnostika}
+
+ <h1 style="font-size:15px;margin-top:28px">Aktualizace</h1>
+ <p class="hint" style="margin-top:4px">Nainstalováno <strong>{verze}</strong>, server nabízí
+   <strong>{nova_verze}</strong>. Původní soubor se uloží jako <code>.bak</code>.</p>
+ {aktualizace_tlacitko}
+ {aktualizace_stav}
 
  <h1 style="font-size:15px;margin-top:28px">Zkusit spojení na železo</h1>
  <p class="hint" style="margin-top:4px">Ověří kabel a adresu <strong>bez serveru</strong> —
@@ -1518,6 +1654,63 @@ _SETTINGS = """<!doctype html>
 #: Poslední ručně zkoušená adresa — displej ji nabídne znovu, obsluha
 #: u trati nemá překlepávat IP dekodéru dvakrát.
 _posledni_zkouska: dict = {"host": "", "port": ""}
+_diagnostika_snapshot: dict | None = None
+_aktualizace_stav = ""
+
+
+def _diagnostika_html() -> str:
+    if _diagnostika_snapshot is None:
+        return ""
+    data = _diagnostika_snapshot
+    interfaces = html.escape(", ".join(
+        f"{row['address']}/{row['prefix']}" for row in data.get("interfaces", [])
+    ) or "žádné IPv4 rozhraní")
+    broadcasts = html.escape(", ".join(data.get("broadcasts", [])) or "žádné")
+    port_class = "ok" if data.get("reply_port_ok") else "chyba"
+    port_text = "volný" if data.get("reply_port_ok") else (
+        html.escape(str(data.get("reply_port_error") or "obsazený"))
+    )
+    return (
+        '<div class="panel">'
+        f"<strong>Rozhraní:</strong> {interfaces}<br>"
+        f"<strong>Broadcast:</strong> {broadcasts}<br>"
+        f'<strong>UDP 5303:</strong> <span class="{port_class}">{port_text}</span><br>'
+        f"<strong>Hodiny krabičky:</strong> {html.escape(str(data.get('local', '—')))}"
+        "</div>"
+    )
+
+
+def _stage_update(worker) -> str:
+    """Stáhne, ověří a atomicky připraví nový soubor agenta."""
+    if worker is None or not worker.connected:
+        return "Aktualizaci nelze stáhnout — krabička není připojená k serveru."
+    if getattr(sys, "frozen", False):
+        return "Zabalenou aplikaci nelze aktualizovat jako Python soubor."
+    try:
+        payload = worker.server.download_agent()
+    except (OSError, TimeoutError, urllib.error.URLError) as exc:
+        return f"Aktualizaci se nepodařilo stáhnout: {exc}"
+    expected = str(getattr(worker, "latest_sha256", "") or "").lower()
+    if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+        return "Aktualizace odmítnuta: server neposlal platný kontrolní součet."
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != expected:
+        return "Aktualizace odmítnuta: kontrolní součet nesouhlasí."
+    try:
+        compile(payload, "track_agent.py", "exec")
+    except SyntaxError as exc:
+        return f"Aktualizace odmítnuta: stažený program není platný ({exc})."
+    current = pathlib.Path(__file__).resolve()
+    backup = current.with_suffix(current.suffix + ".bak")
+    staged = current.with_suffix(current.suffix + ".new")
+    try:
+        staged.write_bytes(payload)
+        if current.exists():
+            backup.write_bytes(current.read_bytes())
+        staged.replace(current)
+    except OSError as exc:
+        return f"Aktualizaci se nepodařilo uložit: {exc}"
+    return "Aktualizace je ověřená a uložená. Projeví se po restartu služby."
 
 
 def _recent_table() -> str:
@@ -1538,11 +1731,11 @@ def _recent_table() -> str:
 
 
 def _screen_state(worker, config: dict) -> dict:
-    """Co má být na displeji: velký stav, a token jen dokud je k něčemu.
+    """Co má být na displeji: velký stav a vždy celý, opisovatelný token.
 
-    **Spárovaná krabička token neukazuje.** Do té doby je to jediné, proč se
-    na displej dívat; potom už je to jen klíč do klubové sítě vystavený celý
-    den na obrazovce u trati. Kdo ho potřebuje znovu, najde ho v nastavení.
+    David 24. 8. 2026 výslovně požaduje celý token i po spárování. Na malém
+    displeji je to hlavní provozní informace; bezpečnost síťových příkazů proto
+    stojí i na omezení cílů na loopback a privátní IPv4 rozsahy.
     """
     connected = bool(worker and worker.connected)
     token = (config.get("token") or "").strip()
@@ -1553,7 +1746,7 @@ def _screen_state(worker, config: dict) -> dict:
             "znak": "✓", "slovo": "OK",
             "detail": worker.status if worker else "",
             "token_popisek": "Token krabičky:",
-            "token": token[: TOKEN_GROUP_LEN] + "-…-" + token[-TOKEN_GROUP_LEN:] if token else "—",
+            "token": token or "—",
         }
     if not configured_server(config):
         return {
@@ -1578,8 +1771,8 @@ def _token_text(token: str) -> str:
     """Token na displeji: dva řádky po třech čtveřicích.
 
     Na jednom řádku se 24 znaků na 3,5" displej nevejde čitelně; na dvou
-    unese písmo skoro dvojnásobný stupeň. Zkrácený tvar spárované krabičky
-    (AKUW-…-7G59) i pomlčkami nedělený text zůstávají na jednom řádku.
+    unese písmo skoro dvojnásobný stupeň. Pomlčkami nedělený text zůstává na
+    jednom řádku.
 
     Zlom je **obyčejný „\n"**, ne `<br>`: obrazovka si stav tahá JSONem
     a text sází přes `textContent`, kde by značka byla vidět jako text.
@@ -1645,6 +1838,7 @@ def _stav_json(worker, config: dict) -> bytes:
             "celkem": prujezdy["celkem"],
             "posledni": prujezdy["naposledy"],
             "odjisteno": _novy_token_odjisten(),
+            "verze": VERSION,
         },
         ensure_ascii=False,
     ).encode("utf-8")
@@ -1683,6 +1877,7 @@ def _render_screen(worker, config: dict) -> bytes:
         cas=time.strftime("%d.%m.%Y %H:%M:%S", now),
         cas_hodiny=time.strftime("%H:%M:%S", now),
         cas_datum=time.strftime("%d.%m.%Y", now),
+        verze=VERSION,
     )
     return page.encode("utf-8")
 
@@ -1714,6 +1909,13 @@ def _service_hint() -> str:
 
 
 def _render_settings(worker, config: dict) -> bytes:
+    latest = getattr(worker, "latest_version", VERSION) if worker else VERSION
+    update_available = latest and latest != VERSION
+    update_button = (
+        '<form method="post" action="/aktualizovat"><button type="submit">'
+        "Stáhnout a připravit aktualizaci</button></form>"
+        if update_available else '<p class="hint ok">Agent je aktuální.</p>'
+    )
     page = _SETTINGS.format(
         stav=(worker.status if worker else "nespuštěno"),
         server=configured_server(config),
@@ -1724,6 +1926,14 @@ def _render_settings(worker, config: dict) -> bytes:
         zkouska_host=_posledni_zkouska.get("host", ""),
         zkouska_port=_posledni_zkouska.get("port", ""),
         spojeni=_recent_table(),
+        diagnostika=_diagnostika_html(),
+        verze=VERSION,
+        nova_verze=latest or "neznámá",
+        aktualizace_tlacitko=update_button,
+        aktualizace_stav=(
+            f'<div class="panel">{html.escape(_aktualizace_stav)}</div>'
+            if _aktualizace_stav else ""
+        ),
     )
     return page.encode("utf-8")
 
@@ -1783,9 +1993,20 @@ def build_web_server(state: dict, *, host: str, port: int):
             self._send(_render_screen(state.get("worker"), config))
 
         def do_POST(self):             # noqa: N802
+            global _aktualizace_stav, _diagnostika_snapshot
             length = int(self.headers.get("Content-Length") or 0)
             form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
             saved = load_config()
+
+            if self.path.startswith("/diagnostika"):
+                _diagnostika_snapshot = network_info({})
+                self._send(b"", status=303, headers=[("Location", "/nastaveni")])
+                return
+
+            if self.path.startswith("/aktualizovat"):
+                _aktualizace_stav = _stage_update(state.get("worker"))
+                self._send(b"", status=303, headers=[("Location", "/nastaveni")])
+                return
 
             if self.path.startswith("/zkusit"):
                 # Test spojení **bez serveru**: obsluha u trati potřebuje před

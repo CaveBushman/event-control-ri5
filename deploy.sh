@@ -45,7 +45,8 @@ DNS="1.1.1.1"
 WITH_KIOSK=1
 WITH_PULL=1
 DRY_RUN=0
-KIOSK_REZIM="zadny"      # plocha | systemd | zadny — podle toho, co drží obrazovku
+KIOSK_REZIM="zadny"      # systemd | zadny — podle toho, zda se instaluje displej
+KIOSK_CEKA_NA_REBOOT=0    # 1 při přechodu z běžící plochy na samostatný kiosk
 
 usage() {
     sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -235,12 +236,32 @@ fi
 krok "Agent"
 spust install -d -m 755 "$INSTALL_DIR"
 
-AGENT_ZDROJ="$ROOT/agent/track_agent.py"
+AGENT_REPO="$ROOT/agent/track_agent.py"
+AGENT_ZDROJ="$AGENT_REPO"
+AGENT_REPO_VERZE="$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$AGENT_REPO" | head -1)"
 AGENT_TMP="$(mktemp)"
 trap 'rm -f "$AGENT_TMP"' EXIT
 if [[ -n "$SERVER" ]] && curl -fsSL --max-time 20 "$SERVER/bmx/api/agent/download/" -o "$AGENT_TMP" 2>/dev/null         && python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$AGENT_TMP" 2>/dev/null; then
-    AGENT_ZDROJ="$AGENT_TMP"
-    info "agent stažen ze serveru $SERVER"
+    AGENT_SERVER_VERZE="$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$AGENT_TMP" | head -1)"
+    # Server je obvykle zdroj pravdy, ale při postupném nasazení může dočasně
+    # nabízet staršího agenta než čerstvý instalační repozitář. Krabičku při
+    # opakovaném deployi nesmíme downgradovat. Číselné porovnání zvládá i
+    # víceciferné části (1.10 > 1.9), na rozdíl od prostého řazení řetězců.
+    if python3 - "$AGENT_SERVER_VERZE" "$AGENT_REPO_VERZE" <<'PY'
+import re, sys
+
+def version_key(value):
+    return tuple(int(part) for part in re.findall(r"\d+", value or ""))
+
+server, repository = sys.argv[1:3]
+raise SystemExit(0 if version_key(server) >= version_key(repository) else 1)
+PY
+    then
+        AGENT_ZDROJ="$AGENT_TMP"
+        info "agent stažen ze serveru $SERVER (verze ${AGENT_SERVER_VERZE:-neznámá})"
+    else
+        info "server nabízí staršího agenta ${AGENT_SERVER_VERZE:-neznámá}; používám přibalenou verzi ${AGENT_REPO_VERZE:-neznámá}"
+    fi
 else
     info "server nedostupný — agent z kopie v repozitáři"
 fi
@@ -297,39 +318,40 @@ needs_root_rights=yes
 "
     fi
 
-    # Dvě cesty, protože Raspberry Pi OS je dvojí. Rozhoduje to, jestli systém
-    # startuje do plochy: ta si obrazovku vezme sama a `cage` by se s ní pral —
-    # displej pak bliká, jak systemd každé tři vteřiny zvedá poraženého.
-    if [[ "$(systemctl get-default 2>/dev/null)" == "graphical.target" ]]; then
-        KIOSK_REZIM="plocha"
-        info "systém startuje do plochy — kiosk poběží uvnitř ní"
-        # Ať po předchozím běhu nezůstane služba, která se o obrazovku pere.
-        if systemctl is-enabled --quiet "$KIOSK_SERVICE@$DESKTOP_USER" 2>/dev/null; then
-            spust systemctl disable --now "$KIOSK_SERVICE@$DESKTOP_USER"
-        fi
-        DESKTOP_HOME="$(getent passwd "$DESKTOP_USER" 2>/dev/null | cut -d: -f6 || true)"
-        DESKTOP_HOME="${DESKTOP_HOME:-/home/$DESKTOP_USER}"
-        spust install -d -m 755 -o "$DESKTOP_USER" -g "$DESKTOP_USER" \
-            "$DESKTOP_HOME/.config/autostart"
-        spust install -m 644 -o "$DESKTOP_USER" -g "$DESKTOP_USER" \
-            "$ROOT/kiosk/event-control-kiosk.desktop" \
-            "$DESKTOP_HOME/.config/autostart/event-control-kiosk.desktop"
-        info "spustí se s plochou uživatele $DESKTOP_USER (po odhlášení a přihlášení)"
-        varuj "Krabička plochu nepotřebuje. Bez ní naběhne displej sama po zapnutí:"
-        varuj "    sudo systemctl set-default multi-user.target && sudo reboot"
-    else
-        KIOSK_REZIM="systemd"
-        spust install -m 644 "$ROOT/systemd/$KIOSK_SERVICE.service" \
-            "/etc/systemd/system/$KIOSK_SERVICE@.service"
-        spust systemctl daemon-reload
-        spust systemctl enable "$KIOSK_SERVICE@$DESKTOP_USER"
-        # Po smyčce restartů zůstane služba „failed" a systemd ji odmítne
-        # spustit, dokud se počítadlo nesmaže.
-        spust systemctl reset-failed "$KIOSK_SERVICE@$DESKTOP_USER" 2>/dev/null || true
-        spust systemctl restart "$KIOSK_SERVICE@$DESKTOP_USER"
-        spust loginctl enable-linger "$DESKTOP_USER"
-        info "běží pod uživatelem $DESKTOP_USER, bez plochy a bez přihlašování"
+    # Krabička je jednoúčelová: výchozí cesta je vždy systémová služba bez
+    # plochy a bez přihlášení. Dřívější větev pro graphical.target ukládala
+    # jen desktopový autostart; bez autologinu pak po zapnutí zůstal displej
+    # na přihlašovací obrazovce a agent vypadal jako něco, co se musí spustit
+    # ručně. multi-user.target pustí agenta i kiosk rovnou po zapnutí zdroje.
+    KIOSK_REZIM="systemd"
+    PUVODNI_TARGET="$(systemctl get-default 2>/dev/null || echo multi-user.target)"
+    if [[ "$PUVODNI_TARGET" == "graphical.target" ]]; then
+        spust systemctl set-default multi-user.target
+        KIOSK_CEKA_NA_REBOOT=1
+        info "výchozí start přepnut na multi-user.target — bez přihlašování"
     fi
+
+    # Starý desktopový autostart by po případném ručním spuštění plochy otevřel
+    # druhý Chromium nad systémovým kioskem. Odstraňuje se jen náš vlastní
+    # přesně pojmenovaný soubor; ostatního nastavení uživatele se nedotýkáme.
+    DESKTOP_HOME="$(getent passwd "$DESKTOP_USER" 2>/dev/null | cut -d: -f6 || true)"
+    DESKTOP_HOME="${DESKTOP_HOME:-/home/$DESKTOP_USER}"
+    spust rm -f "$DESKTOP_HOME/.config/autostart/event-control-kiosk.desktop"
+
+    spust install -m 644 "$ROOT/systemd/$KIOSK_SERVICE.service" \
+        "/etc/systemd/system/$KIOSK_SERVICE@.service"
+    spust systemctl daemon-reload
+    spust systemctl enable "$KIOSK_SERVICE@$DESKTOP_USER"
+    # Po smyčce restartů zůstane služba „failed" a systemd ji odmítne
+    # spustit, dokud se počítadlo nesmaže.
+    spust systemctl reset-failed "$KIOSK_SERVICE@$DESKTOP_USER" 2>/dev/null || true
+    if [[ $KIOSK_CEKA_NA_REBOOT -eq 1 ]]; then
+        info "kiosk je zapnutý pro příští start; nynější plochu ukončí restart"
+    else
+        spust systemctl restart "$KIOSK_SERVICE@$DESKTOP_USER"
+    fi
+    spust loginctl enable-linger "$DESKTOP_USER"
+    info "poběží pod uživatelem $DESKTOP_USER, bez plochy a bez přihlašování"
 else
     krok "Displej přeskočen (--no-kiosk)"
 fi
@@ -405,7 +427,11 @@ if [[ $DRY_RUN -eq 1 ]]; then
     info "nanečisto — služby se nespouštěly"
 else
     for SLUZBA in "${SLUZBY[@]}"; do
-        if systemctl is-active --quiet "$SLUZBA"; then
+        if ! systemctl is-enabled --quiet "$SLUZBA"; then
+            varuj "$SLUZBA není zapnutá pro start systému"
+        elif [[ $KIOSK_CEKA_NA_REBOOT -eq 1 && "$SLUZBA" == "$KIOSK_SERVICE@$DESKTOP_USER" ]]; then
+            info "$SLUZBA je zapnutá a naběhne po restartu"
+        elif systemctl is-active --quiet "$SLUZBA"; then
             info "$SLUZBA běží"
         else
             varuj "$SLUZBA neběží — podívejte se: journalctl -u $SLUZBA -n 30"
@@ -438,7 +464,9 @@ done
 cat <<INFO
   log:   journalctl -u $AGENT_SERVICE -f
 
-Watchdog a vypnuté zhasínání se projeví po restartu: sudo reboot
+Agent i displej jsou nastavené jako výchozí služby. Po každém zapnutí napájení
+naběhnou samy. Watchdog, vypnuté zhasínání a případná změna režimu plochy se
+projeví po restartu: sudo reboot
 INFO
 if [[ $REBOOT_KVULI_DISPLEJI -eq 1 ]]; then
     echo

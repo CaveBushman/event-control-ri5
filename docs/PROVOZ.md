@@ -4,8 +4,9 @@ Krátký seznam pro obsluhu u trati. Podrobnosti jsou v `README.md`.
 
 ## Před závodem (večer nebo ráno)
 
-1. **Zapojit** — napájení, ethernet do stejného switche jako dekodéry. Nic
-   se nespouští, krabička najede sama.
+1. **Zapojit** — napájení, ethernet do stejného switche jako dekodéry. Agent
+   i displej jsou výchozí systemd služby: nic se nepřihlašuje ani nespouští,
+   krabička najede sama.
 2. **Podívat se na displej.** Do minuty má svítit zelené **OK** a text
    *připojen jako … (organizace)*.
 3. **V aplikaci** otevřít *Nastavení aplikace* — u agenta má být zelená tečka

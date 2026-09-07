@@ -41,7 +41,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.6"
+VERSION = "1.7"
 
 #: Kam se agent hlásí, když mu nikdo neřekl jinak. Aplikace běží na jednom
 #: místě, takže adresu nemá co obsluha u trati vypisovat — krabička po zapnutí
@@ -84,9 +84,16 @@ class Server:
             return json.loads(response.read() or b"{}")
 
     def hello(self) -> dict:
+        # `dropped_frames` říká serveru, o kolik rámců krabička přišla —
+        # dohledat je umí jen on (protokolu rozumí a dosáhne na dekodér přes
+        # `tcp_exchange`), a spouští to člověk. Mlčky zahozený rámec je tichá
+        # ztráta výsledku (7. 9. 2026).
+        with _prujezdy_lock:
+            zahozeno = int(_prujezdy["zahozeno"])
         return self._request(
             "/bmx/api/agent/hello/",
-            {"hostname": socket.gethostname(), "version": VERSION},
+            {"hostname": socket.gethostname(), "version": VERSION,
+             "dropped_frames": zahozeno},
             timeout=15.0,
         )
 
@@ -576,6 +583,15 @@ STREAM_BACKLOG_MAX = 2000
 #: rozsypaný proud, ne data (stejná pojistka jako na serveru).
 STREAM_BUFFER_MAX = 256 * 1024
 
+#: Strop souboru přelivu. Rámec zabere ve base64 pár desítek bajtů, takže
+#: osm megabajtů je řádově sto tisíc průjezdů — víc, než kolik jich za den
+#: projede celý závod. Karta v Raspberry je malá a nesmí se zaplnit.
+PRELIV_MAX_BAJTU = 8 * 1024 * 1024
+
+#: Kolik rámců z přelivu se dotáhne na jeden POST. Živá dávka jde první
+#: a tahle za ní, aby doslání historie nezdržovalo aktuální čas na desce.
+PRELIV_DAVKA = 200
+
 #: Poslední průjezdy, které server vzal — pro červenou kontrolku na displeji
 #: (Davidovo zadání 20. 8. 2026: „nešlo by, aby i krabička měla červenou
 #: kontrolku, když přijme průjezd?"). Krabička protokolu nerozumí, takže se
@@ -588,6 +604,14 @@ _prujezdy_lock = threading.Lock()
 _prujezdy = {
     "kdy": 0.0, "celkem": 0, "ze_serveru": None, "naposledy": "",
     "smycka_kdy": 0.0, "server_kdy": 0.0,
+    # Rámce, které **leží na disku** a čekají, až server začne brát. Nejsou
+    # ztracené — krabička je pošle sama, jen později (`Preliv`).
+    "preliv": 0,
+    # Rámce, které se **opravdu ztratily**: nevešly se ani do přelivu (plná
+    # karta, výpadek delší než strop souboru). Tohle už krabička nedohoní —
+    # dekodér si je pamatuje, ale krabička protokolu nerozumí, takže je
+    # stáhne jen aplikace přes ni a spouští to člověk (7. 9. 2026).
+    "zahozeno": 0, "zahozeno_kdy": "",
 }
 
 #: Jak dlouho svítí dioda smyčky/serveru. Je to **puls**, ne stav: delší
@@ -630,6 +654,40 @@ def _zaznamenat_pocitadlo(celkem) -> None:
         _prujezdy["naposledy"] = time.strftime("%H:%M:%S")
 
 
+def _zaznamenat_preliv(ramcu: int) -> None:
+    """Kolik rámců čeká na disku, až server začne brát.
+
+    Není to ztráta ani chyba — je to **odložená zásilka**. Na displeji stojí
+    zvlášť od zahozených, protože obsluha nemá kvůli tomuhle nikam běžet:
+    krabička to dořeší sama, jen potřebuje, aby se server ozval.
+    """
+    with _prujezdy_lock:
+        _prujezdy["preliv"] = max(0, int(ramcu))
+
+
+def _zaznamenat_zahozene(kolik: int) -> None:
+    """Rámce, které se nevešly **ani do přelivu** — spočítat a nezamlčet.
+
+    Tohle je až druhá obrana: při přeplněné frontě jdou starší rámce na disk
+    (`Preliv`) a krabička je pošle sama. Sem se dostane jen to, co se nevešlo
+    ani tam — plná karta nebo výpadek delší než strop souboru.
+
+    A tady už je ztráta skutečná: dekodér si průjezdy pamatuje, ale krabička
+    protokolu P3 nerozumí, takže si je stáhnout neumí. Umí to jen aplikace
+    přes ni (`disciplines/timing_decoders.py::fetch_missing_passings` přes
+    `tcp_exchange`) a **spouští to člověk** — proto se to musí říct serveru
+    i obsluze na displeji.
+
+    Do 7. 9. 2026 se zahazovalo mlčky, s poznámkou „dotáhne si to záložkou".
+    Jenže nikdo se nedozvěděl, že se to má udělat.
+    """
+    if kolik <= 0:
+        return
+    with _prujezdy_lock:
+        _prujezdy["zahozeno"] += kolik
+        _prujezdy["zahozeno_kdy"] = time.strftime("%H:%M:%S")
+
+
 def _zaznamenat_prujezdy(stored: int) -> None:
     if stored <= 0:
         return
@@ -670,6 +728,14 @@ def _prujezdy_stav() -> dict:
         "smycka": sviti(snapshot["smycka_kdy"], LED_SVITI_S),
         "server": sviti(snapshot["server_kdy"], LED_SVITI_S),
         "naposledy": snapshot["naposledy"],
+        # Dvě různé zprávy, ne jedna. „Čeká na disku" je odložená zásilka,
+        # kterou krabička dořeší sama; „zahozeno" je ztráta, kvůli které
+        # musí někdo v aplikaci kliknout. Slít je do jednoho čísla by
+        # znamenalo posílat obsluhu k obrazovce i za výpadek, který se
+        # spraví sám.
+        "preliv": snapshot["preliv"],
+        "zahozeno": snapshot["zahozeno"],
+        "zahozeno_kdy": snapshot["zahozeno_kdy"],
     }
 
 
@@ -733,6 +799,8 @@ class StreamLink:
         service_seconds = float(self.config.get("service_seconds") or 10)
         backoff = RECONNECT_MIN
         backlog: list[str] = []
+        preliv = Preliv(preliv_path(decoder_id))
+        _zaznamenat_preliv(preliv.ceka())
 
         try:
             host, port = _validated_target(host, port)
@@ -750,14 +818,16 @@ class StreamLink:
                     for encoded in self.config.get("open") or []:
                         sock.sendall(base64.b64decode(encoded))
                     backoff = RECONNECT_MIN
-                    self._pump(sock, decoder_id, service, service_seconds, backlog)
+                    self._pump(sock, decoder_id, service, service_seconds,
+                               backlog, preliv)
             except (OSError, TimeoutError, ValueError) as exc:
                 _remember(host, port, False, str(exc))
             if self._stop.wait(backoff):
                 return
             backoff = min(backoff * 2, RECONNECT_MAX)
 
-    def _pump(self, sock, decoder_id, service, service_seconds, backlog) -> None:
+    def _pump(self, sock, decoder_id, service, service_seconds, backlog,
+              preliv) -> None:
         buffer = bytearray()
         last_frame_at = time.monotonic()
         last_service_at = time.monotonic()
@@ -787,8 +857,26 @@ class StreamLink:
                     last_frame_at = time.monotonic()
                     _zaznamenat_smycku()
                 if len(backlog) > STREAM_BACKLOG_MAX:
-                    # Server dlouho nebere — zahodit; dotáhne si to záložkou.
-                    del backlog[: len(backlog) - STREAM_BACKLOG_MAX]
+                    # Server dlouho nebere — **starší rámce na disk**, ne do
+                    # koše. Krabička jim nerozumí, ale uložit a poslat je
+                    # později umí; server jim rozumí a je mu jedno, že
+                    # dorazily se zpožděním (výsledky se počítají z časů
+                    # průjezdů). Živá dávka jde dál první, aby deska u trati
+                    # ukazovala aktuální čas a ne půlhodinu starý.
+                    prebytek = len(backlog) - STREAM_BACKLOG_MAX
+                    starsi = backlog[:prebytek]
+                    del backlog[:prebytek]
+                    ztraceno = preliv.pridej(starsi)
+                    _zaznamenat_preliv(preliv.ceka())
+                    if ztraceno:
+                        # Až tady je ztráta skutečná: plný disk nebo přeliv
+                        # přes strop. Tohle už dohledá jen člověk z dekodéru.
+                        _zaznamenat_zahozene(ztraceno)
+                        log(f"Přeliv nestačí — ztraceno {ztraceno} rámců; "
+                            f"dohledejte průjezdy z dekodéru")
+                    else:
+                        log(f"Server nebere — {prebytek} rámců odloženo "
+                            f"na disk, doletí, až se ozve")
             except socket.timeout:
                 pass
 
@@ -808,6 +896,11 @@ class StreamLink:
                     del backlog[: len(batch)]
                     if answer.get("ok"):
                         _zaznamenat_prujezdy(int(answer.get("stored") or 0))
+                        # Server bere → je čas dorovnat, co leží na disku.
+                        # Jedna dávka za průchod smyčkou: doslání nesmí
+                        # zdržet `recv()`, jinak by aktuální čas na desce
+                        # zaostával o historii.
+                        self._dosli_preliv(decoder_id, preliv)
                     elif answer.get("error"):
                         log(f"Server dávku nevzal: {answer['error']}")
 
@@ -815,8 +908,152 @@ class StreamLink:
                 sock.sendall(service)
                 last_service_at = now
 
+    def _dosli_preliv(self, decoder_id: str, preliv) -> None:
+        """Pošle jednu dávku z přelivu — víc až v dalším průchodu.
+
+        Posun se hýbe **až po přijetí**: kdyby krabička spadla mezi
+        odesláním a potvrzením, pošle dávku znovu a server ji zahodí jako
+        duplikát (průjezd má svoje číslo). Ztratit ji je horší než poslat
+        dvakrát.
+        """
+        if not preliv.ceka():
+            return
+        davka = preliv.dalsi(PRELIV_DAVKA)
+        if not davka:
+            return
+        try:
+            answer = self.server.push_passings(decoder_id, davka)
+        except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+            return
+        if not answer.get("ok"):
+            # „Nechci" (žádný závod si proud neříká) — držet to nemá smysl,
+            # zbytek dotáhne ruční dohledání z dekodéru.
+            preliv.potvrd()
+            _zaznamenat_preliv(preliv.ceka())
+            return
+        preliv.potvrd()
+        _zaznamenat_prujezdy(int(answer.get("stored") or 0))
+        _zaznamenat_preliv(preliv.ceka())
+
 
 # --- běh na pozadí ---------------------------------------------------------
+
+
+class Preliv:
+    """Rámce, které se nevešly do paměťové fronty — **na disk, ne do koše**.
+
+    Do 7. 9. 2026 se při přeplněné frontě mlčky zahazovaly. Přitom krabička
+    nemusí rozumět tomu, co v rámci je, aby ho uložila a poslala později:
+    je to neprůhledný kus bajtů, který server pošle sám sobě, jen se
+    zpožděním. Tohle je jediné dohledání, které krabička zvládne bez
+    znalosti protokolu — a zvládne ho **bez obsluhy**, což ruční dohledání
+    z dekodéru neumí.
+
+    Soubor je řádkový base64: rámec neobsahuje konec řádku, takže se v něm
+    nemá jak splést. Čte se sekvenčně podle posunu, protože přepisovat
+    osmimegabajtový soubor po každé dávce by kartu v Raspberry umlelo.
+
+    Pořadí: **živá dávka jde první, přeliv za ní.** Pro výsledky to nic
+    neznamená (počítají se z časů průjezdů, ne z pořadí příchodu) a pro desku
+    je to lepší — ukáže aktuální stav a historii dorovná dodatečně, místo
+    aby čekala, až se doveze půlhodinový výpadek.
+    """
+
+    def __init__(self, cesta: pathlib.Path):
+        self.cesta = cesta
+        self._posun = 0
+        #: Kam by se posun dostal, kdyby server nabídnutou dávku vzal.
+        self._nabidnuto = 0
+        self._nabidnuto_pocet = 0
+        self._lock = threading.Lock()
+        #: Počet čekajících rámců. Po restartu se sečte ze souboru — displej
+        #: má říct „čeká 800 rámců", ne „čeká 32 kB"; obsluha u trati počítá
+        #: jezdce, ne bajty.
+        self._ceka = self._pocet_v_souboru()
+
+    def _pocet_v_souboru(self) -> int:
+        try:
+            with self.cesta.open("rb") as soubor:
+                return sum(1 for _ in soubor)
+        except OSError:
+            return 0
+
+    def pridej(self, radky: list) -> int:
+        """Uloží rámce a vrátí, **kolik se jich opravdu ztratilo**.
+
+        Ztráta nastane jen při plném disku nebo přeplněném souboru; taková
+        se hlásí serveru a řeší se ručním dohledáním z dekodéru (to jde od
+        záložky dál, takže díra se dotáhne celá).
+        """
+        if not radky:
+            return 0
+        with self._lock:
+            try:
+                if self.cesta.exists() and self.cesta.stat().st_size > PRELIV_MAX_BAJTU:
+                    return len(radky)
+                self.cesta.parent.mkdir(parents=True, exist_ok=True)
+                with self.cesta.open("a", encoding="ascii") as soubor:
+                    soubor.write("".join(f"{radek}\n" for radek in radky))
+                self._ceka += len(radky)
+                return 0
+            except OSError:
+                # Karta plná nebo jen pro čtení — víc než přiznat ztrátu se
+                # tady udělat nedá.
+                return len(radky)
+
+    def ceka(self) -> int:
+        """Kolik rámců v přelivu ještě nikdo neodeslal (0 = prázdno)."""
+        with self._lock:
+            return self._ceka
+
+    def dalsi(self, kolik: int) -> list:
+        """Další dávka k odeslání; posun se hýbe až po `potvrd()`."""
+        with self._lock:
+            try:
+                with self.cesta.open("r", encoding="ascii") as soubor:
+                    soubor.seek(self._posun)
+                    davka = []
+                    for _ in range(kolik):
+                        radek = soubor.readline()
+                        if not radek.endswith("\n"):
+                            # Nedopsaný poslední řádek — dopíše se za chvíli,
+                            # teď by se poslal ořezaný.
+                            break
+                        radek = radek.strip()
+                        if radek:
+                            davka.append(radek)
+                    self._nabidnuto = soubor.tell()
+                    self._nabidnuto_pocet = len(davka)
+                return davka
+            except OSError:
+                return []
+
+    def potvrd(self) -> None:
+        """Server dávku vzal — posunout se za ni a případně soubor smazat."""
+        with self._lock:
+            self._posun = max(self._posun, self._nabidnuto)
+            self._ceka = max(0, self._ceka - self._nabidnuto_pocet)
+            self._nabidnuto_pocet = 0
+            try:
+                if self.cesta.stat().st_size <= self._posun:
+                    # Doslané je doslané — soubor smazat, ať karta nedrží
+                    # osm megabajtů historie do dalšího závodu.
+                    self.cesta.unlink()
+                    self._posun = 0
+                    self._ceka = 0
+            except OSError:
+                pass
+
+
+def preliv_path(decoder_id: str) -> pathlib.Path:
+    """Soubor přelivu pro jednu smyčku — vedle nastavení, ne v /tmp.
+
+    Vedle nastavení proto, že přeliv musí přežít restart krabičky: výpadek
+    sítě a restart jdou v praxi spolu (někdo přepojuje switch).
+    """
+    jmeno = "".join(z for z in decoder_id if z.isalnum() or z in "-_")[:36]
+    return config_path().with_name(f"preliv-{jmeno or 'smycka'}.txt")
+
 
 
 class Worker:
@@ -1370,6 +1607,21 @@ _STYLE = """
  .paticka a {{ color:#93c5fd; font-weight:900; text-decoration:none; }}
  .paticka .vlevo {{ display:flex; align-items:center; gap:8px; min-width:0; }}
 
+ /* Zahozené rámce. Červená proto, že je to **ztráta výsledku**, ne varování:
+    dohledat se dá jen z dekodéru a jen dokud si je pamatuje. */
+ .zahozeno {{ margin-top:10px; padding:8px 12px; border-radius:8px;
+              background:#7f1d1d; color:#fff; font-weight:900;
+              font-size:clamp(.6rem,1.3vw,.9rem); text-align:center; }}
+ .zahozeno strong {{ color:#fff; }}
+
+ /* Přeliv na disku. **Oranžová, ne červená**: nic se neztratilo, jen to
+    čeká na server. Kdyby to svítilo červeně jako ztráta, obsluha by
+    u každého výpadku wifi běžela k počítači zbytečně. */
+ .preliv {{ margin-top:10px; padding:8px 12px; border-radius:8px;
+            background:#78350f; color:#fed7aa; font-weight:900;
+            font-size:clamp(.6rem,1.3vw,.9rem); text-align:center; }}
+ .preliv strong {{ color:#fff; }}
+
  /* Malé SPI displeje (MHS35: 480×320). Spodní mez clamp() je stavěná na
     monitor — tady by token, kvůli kterému displej existuje, skončil pod
     spodním okrajem. Ustupuje všechno kromě tokenu a diod. */
@@ -1469,6 +1721,23 @@ _SCREEN = """<!doctype html>
   </div>
  </section>
 
+ <!-- Zahozené rámce: **jediná ztráta, kterou krabička nedohoní sama.**
+      Kreslí se jen když k ní došlo, a hned s tím, co udělat — obsluha
+      u trati je ten, kdo dohledání spouští, a bez věty „co teď" je hlášení
+      jen zlá zpráva. -->
+ <div id="zahozeno-pruh" class="zahozeno" hidden>
+  &#9888;&nbsp;ZAHOZENO <strong id="zahozeno-pocet">0</strong> RÁMCŮ
+  (<span id="zahozeno-kdy"></span>) — V APLIKACI DOHLEDEJTE PRŮJEZDY Z DEKODÉRU
+ </div>
+
+ <!-- Přeliv: rámce leží na disku a čekají, až server začne brát. Obsluha
+      nemá nikam běžet — tohle je informace „nic se neztratilo", ne úkol.
+      Proto oranžově a s větou o tom, že to doletí samo. -->
+ <div id="preliv-pruh" class="preliv" hidden>
+  &#8987;&nbsp;<strong id="preliv-pocet">0</strong> RÁMCŮ ČEKÁ NA DISKU —
+  DOLETÍ SAMY, JAK SE SERVER OZVE
+ </div>
+
  <footer class="paticka">
   <span class="vlevo">&#8635;&nbsp;POSLEDNÍ PRŮJEZD: <strong id="posledni">{posledni}</strong></span>
   <span>AGENT <strong id="verze">{verze}</strong></span>
@@ -1524,6 +1793,23 @@ _SCREEN = """<!doctype html>
     else napis("text-server", "PŘIPRAVEN", "");
 
     document.getElementById("posledni").textContent = data.posledni || "--:--:--";
+    // Ztráta **není puls**: pruh zůstane svítit, dokud agent běží. Zmizet
+    // po dvou sekundách jako dioda by z ní udělalo něco, co se dá přehlédnout.
+    var zahozeno = Number(data.zahozeno || 0);
+    var pruh = document.getElementById("zahozeno-pruh");
+    pruh.hidden = zahozeno <= 0;
+    if (zahozeno > 0) {{
+      document.getElementById("zahozeno-pocet").textContent = String(zahozeno);
+      document.getElementById("zahozeno-kdy").textContent = data.zahozeno_kdy || "";
+    }}
+    // Přeliv naopak **je** dočasný: až se server ozve, číslo padá k nule
+    // a pruh zmizí. Že mizí sám, je ta informace.
+    var preliv = Number(data.preliv || 0);
+    var prelivPruh = document.getElementById("preliv-pruh");
+    prelivPruh.hidden = preliv <= 0;
+    if (preliv > 0) {{
+      document.getElementById("preliv-pocet").textContent = String(preliv);
+    }}
     document.getElementById("znak").textContent = data.znak;
     document.getElementById("slovo").textContent = data.slovo;
     document.getElementById("detail").textContent = data.detail;
@@ -1785,6 +2071,47 @@ def _token_text(token: str) -> str:
     return "-".join(groups[:half]) + "\n" + "-".join(groups[half:])
 
 
+#: Cesty POST, které **mění stav krabičky** — adresu serveru, token,
+#: připravenou aktualizaci. Ty smí jen z tohohle počítače.
+#:
+#: Proč (2. 9. 2026): stránka je displej krabičky a služba ji pouští na
+#: `0.0.0.0`, aby se na ni dalo koukat z notebooku
+#: (`deploy/systemd/event-control-agent.service`). Ověření ale žádné neměla,
+#: takže **kdokoli na klubové síti mohl agenta přepojit na svůj server** —
+#: `save_config(server_url, …)` a hned `Worker(server_url, token).start()`.
+#: Token i průjezdy by pak šly jemu. Jištění dvěma klepnutími chrání jen
+#: záměnu tokenu, a jen proti náhodnému doteku na displeji.
+#:
+#: Čtení a **diagnostika zůstávají odkudkoli**: displej má fungovat
+#: z notebooku a „Test spojení" i „Diagnostika sítě" obsluha před závodem
+#: potřebuje. Nic z toho nemění, na co je agent připojený.
+POST_JEN_MISTNE = ("/nastaveni", "/novy-token", "/aktualizovat")
+
+
+def _je_z_tohoto_pocitace(adresa: str) -> bool:
+    """Přišel požadavek z loopbacku? Prázdné nebo nečitelné = ne."""
+    if not adresa:
+        return False
+    try:
+        return ipaddress.ip_address(adresa.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
+def _meni_stav(cesta: str) -> bool:
+    """Mění tenhle POST nastavení krabičky?
+
+    Kromě vyjmenovaných cest sem patří i **prázdná cesta a `/`**: uložení
+    nastavení je propad na konci `do_POST`, takže formulář z hlavní stránky
+    by se jinak protáhl bez kontroly.
+    """
+    if any(cesta.startswith(p) for p in POST_JEN_MISTNE):
+        return True
+    return not any(
+        cesta.startswith(p) for p in ("/diagnostika", "/zkusit")
+    )
+
+
 def _novy_token_odjisten() -> bool:
     return (time.monotonic() - _novy_token_pozadan) <= NOVY_TOKEN_POTVRZENI_S
 
@@ -1837,6 +2164,9 @@ def _stav_json(worker, config: dict) -> bytes:
             "server": prujezdy["server"],
             "celkem": prujezdy["celkem"],
             "posledni": prujezdy["naposledy"],
+            "preliv": prujezdy["preliv"],
+            "zahozeno": prujezdy["zahozeno"],
+            "zahozeno_kdy": prujezdy["zahozeno_kdy"],
             "odjisteno": _novy_token_odjisten(),
             "verze": VERSION,
         },
@@ -1997,6 +2327,21 @@ def build_web_server(state: dict, *, host: str, port: int):
             length = int(self.headers.get("Content-Length") or 0)
             form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
             saved = load_config()
+
+            # Zápis nastavení jen z tohohle počítače (viz `POST_JEN_MISTNE`).
+            # Tělo se přečte **dřív**, jinak by odmítnutý požadavek nechal
+            # data v soketu a prohlížeč by dostal reset místo odpovědi.
+            if _meni_stav(self.path) and not _je_z_tohoto_pocitace(
+                self.client_address[0] if self.client_address else ""
+            ):
+                log(f"Odmítnut zápis z {self.client_address[0]}: {self.path}")
+                self._send(
+                    "Nastavení krabičky se mění jen na ní samotné. "
+                    "Z jiného počítače je stránka jen ke čtení.".encode("utf-8"),
+                    status=403,
+                    headers=[("Content-Type", "text/plain; charset=utf-8")],
+                )
+                return
 
             if self.path.startswith("/diagnostika"):
                 _diagnostika_snapshot = network_info({})

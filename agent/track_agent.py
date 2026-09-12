@@ -43,7 +43,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.9"
+VERSION = "1.10"
 
 #: Kam se agent hlásí, když mu nikdo neřekl jinak. Aplikace běží na jednom
 #: místě, takže adresu nemá co obsluha u trati vypisovat — krabička po zapnutí
@@ -653,6 +653,11 @@ STREAM_BUFFER_MAX = 256 * 1024
 #: Strop souboru přelivu. Rámec zabere ve base64 pár desítek bajtů, takže
 #: osm megabajtů je řádově sto tisíc průjezdů — víc, než kolik jich za den
 #: projede celý závod. Karta v Raspberry je malá a nesmí se zaplnit.
+#: Jak dlouho se čeká, než se rámec podaří odevzdat. Co neprojde do dvou
+#: dnů, se maže (Davidovo zadání 12. 9. 2026): průjezd starší než víkend do
+#: žádného otevřeného závodu nepatří a karta ho nemá vozit do příští sezóny.
+PRELIV_MAX_DNI = 2
+
 PRELIV_MAX_BAJTU = 8 * 1024 * 1024
 
 #: Kolik rámců z přelivu se dotáhne na jeden POST. Živá dávka jde první
@@ -996,7 +1001,17 @@ class StreamLink:
         if not preliv.ceka():
             return
         davka = preliv.dalsi(PRELIV_DAVKA)
+        # **Prošlé se zahodí, i když se dávka neposílá.** Krabička, která se
+        # k serveru dva dny nedostala, nemá co vozit; ztráta se přizná, ať je
+        # na displeji i v cloudu vidět (1.10).
+        prosle = preliv.prosle()
         if not davka:
+            zahozeno = preliv.zahod_prosle()
+            if zahozeno:
+                _zaznamenat_zahozene(zahozeno)
+                _zaznamenat_preliv(preliv.ceka())
+                log(f"Přeliv: {zahozeno} rámců starších {PRELIV_MAX_DNI} dnů "
+                    f"zahozeno — do žádného otevřeného závodu už nepatří")
             return
         try:
             answer = self.server.push_passings(decoder_id, davka)
@@ -1007,6 +1022,9 @@ class StreamLink:
             # neposouvá: potvrdit nedoručené by bylo tiché zahození (1.9).
             return
         preliv.potvrd()
+        if prosle:
+            _zaznamenat_zahozene(prosle)
+            log(f"Přeliv: {prosle} rámců starších {PRELIV_MAX_DNI} dnů zahozeno")
         _zaznamenat_prujezdy(int(answer.get("stored") or 0))
         _zaznamenat_preliv(preliv.ceka())
 
@@ -1024,9 +1042,15 @@ class Preliv:
     znalosti protokolu — a zvládne ho **bez obsluhy**, což ruční dohledání
     z dekodéru neumí.
 
-    Soubor je řádkový base64: rámec neobsahuje konec řádku, takže se v něm
-    nemá jak splést. Čte se sekvenčně podle posunu, protože přepisovat
-    osmimegabajtový soubor po každé dávce by kartu v Raspberry umlelo.
+    Soubor je řádkový: `unixový čas přidání` + mezera + base64 rámce. Rámec
+    neobsahuje konec řádku ani mezeru, takže se v něm nemá jak splést. Čte se
+    sekvenčně podle posunu, protože přepisovat osmimegabajtový soubor po
+    každé dávce by kartu v Raspberry umlelo.
+
+    **Co se nepodaří odevzdat do dvou dnů, se maže** (Davidovo zadání
+    12. 9. 2026). Průjezd starší než víkend do žádného otevřeného závodu
+    nepatří a karta ho nemá vozit do příští sezóny; ztráta se přizná
+    (`zahozeno`) a je vidět na displeji i v cloudu.
 
     Pořadí: **živá dávka jde první, přeliv za ní.** Pro výsledky to nic
     neznamená (počítají se z časů průjezdů, ne z pořadí příchodu) a pro desku
@@ -1040,11 +1064,29 @@ class Preliv:
         #: Kam by se posun dostal, kdyby server nabídnutou dávku vzal.
         self._nabidnuto = 0
         self._nabidnuto_pocet = 0
+        #: Kolik rámců poslední `dalsi()` zahodila jako prošlé (starší dvou dnů).
+        self._prosle = 0
         self._lock = threading.Lock()
         #: Počet čekajících rámců. Po restartu se sečte ze souboru — displej
         #: má říct „čeká 800 rámců", ne „čeká 32 kB"; obsluha u trati počítá
         #: jezdce, ne bajty.
         self._ceka = self._pocet_v_souboru()
+
+    @staticmethod
+    def _radek(ramec: str, kdy: float | None = None) -> str:
+        return f"{int(kdy if kdy is not None else time.time())} {ramec}\n"
+
+    @staticmethod
+    def _rozloz(radek: str) -> tuple[int, str]:
+        """`(čas přidání, rámec)`. Řádek bez času je z verze ≤1.9 — bere se
+        jako čerstvý, protože kdy vznikl, se už zjistit nedá."""
+        kdy, _, ramec = radek.strip().partition(" ")
+        if not ramec:
+            return int(time.time()), kdy
+        try:
+            return int(kdy), ramec
+        except ValueError:
+            return int(time.time()), radek.strip()
 
     def _pocet_v_souboru(self) -> int:
         try:
@@ -1067,8 +1109,9 @@ class Preliv:
                 if self.cesta.exists() and self.cesta.stat().st_size > PRELIV_MAX_BAJTU:
                     return len(radky)
                 self.cesta.parent.mkdir(parents=True, exist_ok=True)
+                ted = time.time()
                 with self.cesta.open("a", encoding="ascii") as soubor:
-                    soubor.write("".join(f"{radek}\n" for radek in radky))
+                    soubor.write("".join(self._radek(radek, ted) for radek in radky))
                 self._ceka += len(radky)
                 return 0
             except OSError:
@@ -1087,21 +1130,51 @@ class Preliv:
             try:
                 with self.cesta.open("r", encoding="ascii") as soubor:
                     soubor.seek(self._posun)
-                    davka = []
-                    for _ in range(kolik):
+                    davka, prosle = [], 0
+                    hranice = time.time() - PRELIV_MAX_DNI * 86400
+                    while len(davka) < kolik:
                         radek = soubor.readline()
                         if not radek.endswith("\n"):
                             # Nedopsaný poslední řádek — dopíše se za chvíli,
                             # teď by se poslal ořezaný.
                             break
-                        radek = radek.strip()
-                        if radek:
-                            davka.append(radek)
+                        if not radek.strip():
+                            continue
+                        kdy, ramec = self._rozloz(radek)
+                        if kdy < hranice:
+                            # **Starší než dva dny se zahazuje** a počítá jako
+                            # ztráta: do žádného otevřeného závodu už nepatří.
+                            prosle += 1
+                            continue
+                        davka.append(ramec)
                     self._nabidnuto = soubor.tell()
-                    self._nabidnuto_pocet = len(davka)
+                    self._nabidnuto_pocet = len(davka) + prosle
+                    self._prosle = prosle
                 return davka
             except OSError:
                 return []
+
+    def prosle(self) -> int:
+        """Kolik rámců poslední `dalsi()` zahodila, protože jim vypršel čas."""
+        with self._lock:
+            return self._prosle
+
+    def zahod_prosle(self) -> int:
+        """Posune se za rámce, kterým vypršel čas — i když se nic neodesílalo.
+
+        Bez tohohle by prošlé rámce ležely ve frontě navždy u krabičky, která
+        se serverem nemluví: `dalsi()` je sice přeskočí, ale posun se hýbe až
+        po `potvrd()`, a ten přijde jen po přijaté dávce.
+        """
+        self.dalsi(PRELIV_DAVKA)
+        with self._lock:
+            if not self._prosle:
+                return 0
+            prosle = self._prosle
+        # Posun i počet čekajících se srovnají touž cestou jako po přijetí;
+        # rámce v dávce, které prošlé nejsou, se nabídnou znovu příště.
+        self.potvrd()
+        return prosle
 
     def potvrd(self) -> None:
         """Server dávku vzal — posunout se za ni a případně soubor smazat."""

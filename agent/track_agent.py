@@ -29,6 +29,7 @@ import argparse
 import base64
 import hashlib
 import html
+import http.client
 import ipaddress
 import json
 import os
@@ -39,9 +40,10 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
-VERSION = "1.7"
+VERSION = "1.8"
 
 #: Kam se agent hlásí, když mu nikdo neřekl jinak. Aplikace běží na jednom
 #: místě, takže adresu nemá co obsluha u trati vypisovat — krabička po zapnutí
@@ -70,18 +72,83 @@ def log(message: str) -> None:
 class Server:
     """Dotazy na aplikaci. Token se posílá v hlavičce, ne v adrese."""
 
+    #: Pády, po kterých má smysl zopakovat požadavek hned na novém spojení:
+    #: server (nebo NAT po LTE) držené spojení pustil a poznalo se to až teď.
+    _ZASTARALE = (http.client.RemoteDisconnected, http.client.BadStatusLine,
+                  ConnectionResetError, BrokenPipeError)
+
     def __init__(self, base: str, token: str):
         self.base = base.rstrip("/")
         self.token = token
+        # Držená spojení **na vlákno**: proud průjezdů posílá dávky z vlastního
+        # vlákna, hlavní smyčka se ptá na příkazy — `http.client` nesnese dva
+        # požadavky na jednom spojení naráz.
+        self._mistni = threading.local()
+
+    def _spojeni(self, casti, timeout: float):
+        cache = getattr(self._mistni, "spojeni", None)
+        if cache is None:
+            cache = self._mistni.spojeni = {}
+        klic = (casti.scheme, casti.netloc)
+        spojeni = cache.get(klic)
+        if spojeni is None:
+            trida = (http.client.HTTPSConnection if casti.scheme == "https"
+                     else http.client.HTTPConnection)
+            spojeni = trida(casti.hostname, casti.port, timeout=timeout)
+            cache[klic] = spojeni
+        else:
+            spojeni.timeout = timeout
+            if spojeni.sock is not None:
+                spojeni.sock.settimeout(timeout)
+        return klic, spojeni
+
+    def _zahod(self, klic) -> None:
+        cache = getattr(self._mistni, "spojeni", None) or {}
+        spojeni = cache.pop(klic, None)
+        if spojeni is not None:
+            spojeni.close()
 
     def _request(self, path: str, payload: dict | None = None, *, timeout: float) -> dict:
+        """Jeden požadavek po **drženém** spojení.
+
+        Do verze 1.7 šel každý požadavek přes `urllib.request.urlopen`, tedy
+        nové TCP + TLS spojení: po LTE u trati 200–400 ms **na každou dávku
+        průjezdů** — víc než celá práce serveru. Držené spojení pošle průjezd
+        v jedné cestě tam a zpátky (David 12. 9. 2026: „potřebuji signál
+        z dekodéru on-line, ne se zpožděním").
+
+        Odpověď mimo 2xx se hlásí jako `urllib.error.HTTPError` stejně jako
+        dřív, aby volající (403 = čeká na schválení) nemuseli nic měnit.
+        """
         url = f"{self.base}{path}"
+        casti = urllib.parse.urlsplit(url)
+        cesta = casti.path + (f"?{casti.query}" if casti.query else "")
         data = None if payload is None else json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(url, data=data, method="POST" if data else "GET")
-        request.add_header("Authorization", f"Bearer {self.token}")
-        request.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read() or b"{}")
+        hlavicky = {"Authorization": f"Bearer {self.token}",
+                    "Content-Type": "application/json"}
+        for pokus in (1, 2):
+            klic, spojeni = self._spojeni(casti, timeout)
+            try:
+                spojeni.request("POST" if data else "GET", cesta, body=data, headers=hlavicky)
+                odpoved = spojeni.getresponse()
+                telo = odpoved.read()
+                if odpoved.will_close:
+                    self._zahod(klic)
+                if odpoved.status >= 400:
+                    raise urllib.error.HTTPError(url, odpoved.status, odpoved.reason,
+                                                 odpoved.headers, None)
+                return json.loads(telo or b"{}")
+            except self._ZASTARALE as exc:
+                self._zahod(klic)
+                if pokus == 2:
+                    raise OSError(f"spojení na server padlo: {exc}") from exc
+            except http.client.HTTPException as exc:
+                self._zahod(klic)
+                raise OSError(f"HTTP klient: {exc}") from exc
+            except OSError:
+                self._zahod(klic)
+                raise
+        raise OSError("spojení na server se nepodařilo obnovit")  # pragma: no cover
 
     def hello(self) -> dict:
         # `dropped_frames` říká serveru, o kolik rámců krabička přišla —

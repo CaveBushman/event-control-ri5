@@ -1725,6 +1725,13 @@ _STYLE = """
  .hodiny {{ text-align:right; }}
  .hodiny .cas {{ font-weight:900; line-height:1; font-size:clamp(1.5rem, 4vw, 3rem); }}
  .hodiny .datum {{ margin-top:4px; color:#d4d4d8; font-size:clamp(.75rem, 1.8vw, 1.2rem); }}
+ /* Verze agenta v hlavičce. V patičce byla od začátku, jenže na 3,5"
+    displeji u trati si jí nikdo nevšiml — a po nasazení je to první věc,
+    kterou obsluha potřebuje ověřit („ideálně bych na obrazovce RI viděl
+    i verzi agenta", David 12. 9. 2026). */
+ .hodiny .verze {{ margin-top:2px; color:#a1a1aa; letter-spacing:.08em;
+                   font-size:clamp(.6rem, 1.3vw, .9rem); }}
+ .hodiny .verze strong {{ color:#a3e635; }}
 
  /* Dvě karty na polovinu: stav serveru a tlačítko nového tokenu. */
  .dvojice {{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }}
@@ -1834,6 +1841,7 @@ _STYLE = """
    h1 {{ font-size:1.25rem; letter-spacing:.08em; }}
    .hodiny .cas {{ font-size:1rem; }}
    .hodiny .datum {{ font-size:.58rem; margin-top:1px; }}
+   .hodiny .verze {{ font-size:.52rem; margin-top:0; letter-spacing:.04em; }}
    .dvojice {{ gap:6px; }}
    .karta {{ min-height:0; padding:6px; border-radius:12px; border-width:1px; }}
    .karta .popisek {{ font-size:.6rem; }}
@@ -1880,6 +1888,7 @@ _SCREEN = """<!doctype html>
   <div class="hodiny">
    <div class="cas" id="cas">{cas_hodiny}</div>
    <div class="datum" id="datum">{cas_datum}</div>
+   <div class="verze">AGENT <strong>{verze}</strong></div>
   </div>
  </header>
 

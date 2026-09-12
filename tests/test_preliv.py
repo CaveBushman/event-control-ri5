@@ -194,31 +194,6 @@ def _link(server, tmp_path):
     return link
 
 
-def test_pump_prebytek_odlozi_misto_zahozeni(tmp_path, monkeypatch):
-    """**Jádro celé změny.** Server nebere → rámce na disk, ne do koše."""
-    monkeypatch.setattr(ta, "STREAM_BACKLOG_MAX", 3)
-    monkeypatch.setattr(ta, "STREAM_QUIET_SECONDS", 0.0)
-    with ta._prujezdy_lock:
-        ta._prujezdy["zahozeno"] = 0
-
-    server = _NeberouciServer()
-    link = _link(server, tmp_path)
-    preliv = _preliv(tmp_path)
-    sock = _FalesnySocket([b"".join(_ramec(i) for i in range(10))])
-
-    # Jedno kolo: rámce se načtou, přebytek jde na disk. Pak `_stop`, ať
-    # se smyčka nemotá dokola.
-    def po_prvnim_kole(*_a, **_k):
-        link._stop.set()
-        return 0
-
-    monkeypatch.setattr(ta, "_zaznamenat_preliv", po_prvnim_kole)
-    link._pump(sock, "dek-1", b"", 999, [], preliv)
-
-    assert preliv.ceka() == 7, "deset rámců, tři se vejdou do paměti"
-    assert ta._prujezdy_stav()["zahozeno"] == 0, "nic se neztratilo"
-    assert server.pokusy >= 1, "poslat to zkusil"
-
 
 def test_dosli_preliv_posle_a_potvrdi(tmp_path):
     """Až server bere, historie doletí — a soubor se uklidí."""

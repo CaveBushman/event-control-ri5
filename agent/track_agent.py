@@ -35,6 +35,7 @@ import json
 import os
 import pathlib
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -43,7 +44,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.10"
+VERSION = "1.11"
 
 #: Kam se agent hlásí, když mu nikdo neřekl jinak. Aplikace běží na jednom
 #: místě, takže adresu nemá co obsluha u trati vypisovat — krabička po zapnutí
@@ -176,7 +177,7 @@ class Server:
         """Pošle rámce průjezdů hned, jak je dekodér vydal (base64)."""
         return self._request(
             "/bmx/api/agent/passings/",
-            {"decoder": decoder_id, "frames": frames},
+            {"decoder": decoder_id, "frames": frames, "receipt": True},
             timeout=15.0,
         )
 
@@ -635,16 +636,9 @@ def run_command(server: Server, command: dict) -> None:
 STREAM_SOR = 0x8E
 STREAM_EOR = 0x8F
 
-#: Průjezdy se posílají po skupinkách: osm jezdců projede cílem ve zlomku
-#: sekundy a POST na každý zvlášť by byl osminásobný provoz. Delší čekání by
-#: zdržovalo obrazovku, takže jen okamžik.
-STREAM_QUIET_SECONDS = 0.1
+#: Odesílatel bere dostupné rámce ihned, bez čekání na další rámec.
 STREAM_MAX_FRAMES = 50
-
-#: Kolik rámců smí čekat na odeslání, když server zrovna nebere. Víc znamená
-#: výpadek — zahodit a nechat server dotáhnout záložkou (od té se stahuje
-#: jen to, co nedošlo).
-STREAM_BACKLOG_MAX = 2000
+STREAM_RETRY_SECONDS = 1.0
 
 #: Strop bufferu proudu — rámec má desítky bajtů; víc bez konce rámce je
 #: rozsypaný proud, ne data (stejná pojistka jako na serveru).
@@ -837,6 +831,7 @@ class StreamLink:
         self.server = server
         self.config = dict(config)
         self._stop = threading.Event()
+        self._ready = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
             name=f"stream-{config.get('host')}",
@@ -848,6 +843,7 @@ class StreamLink:
 
     def stop(self) -> None:
         self._stop.set()
+        self._ready.set()
 
     def is_alive(self) -> bool:
         return self._thread.is_alive()
@@ -858,6 +854,8 @@ class StreamLink:
         Otevírací rámce se mění se záložkou serveru; přehrávají se jen při
         (re)connectu, takže běžící spojení kvůli nim netřeba trhat.
         """
+        if self._stop.is_set():
+            return False
         for key in ("decoder", "host", "port", "service", "service_seconds"):
             if self.config.get(key) != config.get(key):
                 return False
@@ -870,10 +868,6 @@ class StreamLink:
         service = base64.b64decode(self.config.get("service") or b"")
         service_seconds = float(self.config.get("service_seconds") or 10)
         backoff = RECONNECT_MIN
-        backlog: list[str] = []
-        preliv = Preliv(preliv_path(decoder_id))
-        _zaznamenat_preliv(preliv.ceka())
-
         try:
             host, port = _validated_target(host, port)
         except ValueError as exc:
@@ -881,111 +875,95 @@ class StreamLink:
             log(f"Proud {host}:{port} odmítnut: {exc}")
             return
 
-        while not self._stop.is_set():
+        # Jediný odesílatel žije přes reconnecty dekodéru. Historie tak
+        # doletí i tehdy, když dekodér mlčí nebo je odpojený.
+        with FrameQueue(preliv_path(decoder_id).with_suffix(".sqlite3")) as pending:
+            legacy = Preliv(preliv_path(decoder_id))
+            while legacy.ceka():
+                frames = legacy.dalsi(STREAM_MAX_FRAMES)
+                expired = legacy.prosle()
+                if not frames:
+                    legacy.zahod_prosle()
+                    _zaznamenat_zahozene(expired)
+                    break
+                if pending.pridej(frames, received=legacy._casy):
+                    break  # starý soubor ponechat; migrace se zopakuje po restartu
+                legacy.potvrd()
+                _zaznamenat_zahozene(expired)
+            sender = threading.Thread(target=self._send_loop,
+                                      args=(decoder_id, pending), daemon=True)
+            sender.start()
             try:
-                with socket.create_connection((host, port), timeout=3.0) as sock:
-                    sock.settimeout(1.0)
-                    _remember(host, port, True, "proud průjezdů")
-                    log(f"Proud {host}:{port} otevřen")
-                    for encoded in self.config.get("open") or []:
-                        sock.sendall(base64.b64decode(encoded))
-                    backoff = RECONNECT_MIN
-                    self._pump(sock, decoder_id, service, service_seconds,
-                               backlog, preliv)
-            except (OSError, TimeoutError, ValueError) as exc:
-                _remember(host, port, False, str(exc))
-            if self._stop.wait(backoff):
-                return
-            backoff = min(backoff * 2, RECONNECT_MAX)
+                while not self._stop.is_set():
+                    try:
+                        with socket.create_connection((host, port), timeout=3.0) as sock:
+                            sock.settimeout(1.0)
+                            _remember(host, port, True, "proud průjezdů")
+                            for encoded in self.config.get("open") or []:
+                                sock.sendall(base64.b64decode(encoded))
+                            backoff = RECONNECT_MIN
+                            self._pump(sock, pending, service, service_seconds)
+                    except (OSError, TimeoutError, ValueError) as exc:
+                        _remember(host, port, False, str(exc))
+                    if self._stop.wait(backoff):
+                        break
+                    backoff = min(backoff * 2, RECONNECT_MAX)
+            finally:
+                self._stop.set()
+                self._ready.set()
+                sender.join()
 
-    def _pump(self, sock, decoder_id, service, service_seconds, backlog,
-              preliv) -> None:
-        buffer = bytearray()
-        last_frame_at = time.monotonic()
-        last_service_at = time.monotonic()
-
+    def _send_loop(self, decoder_id, pending) -> None:
         while not self._stop.is_set():
-            # Jakmile leží v backlogu první průjezd, nesmí nás další
-            # `recv()` na celou sekundu zablokovat. Dřív se deklarované
-            # 0,3s dávkovací okno kontrolovalo až po 1s socket timeoutu,
-            # takže samotná krabička spotřebovala celý požadovaný limit.
-            if backlog:
-                quiet_left = STREAM_QUIET_SECONDS - (
-                    time.monotonic() - last_frame_at
-                )
-                sock.settimeout(max(0.01, min(STREAM_QUIET_SECONDS, quiet_left)))
-            else:
-                sock.settimeout(1.0)
+            self._ready.clear()
+            try:
+                frames = pending.dalsi(STREAM_MAX_FRAMES)
+                _zaznamenat_preliv(pending.ceka())
+                if not frames:
+                    self._ready.wait(1.0)
+                    continue
+                started = time.monotonic()
+                answer = self.server.push_passings(decoder_id, frames)
+                if not answer.get("ok"):
+                    self._stop.wait(STREAM_RETRY_SECONDS)
+                    continue
+                pending.potvrd()
+                _zaznamenat_prujezdy(int(answer.get("stored") or 0))
+                _zaznamenat_preliv(pending.ceka())
+                elapsed = (time.monotonic() - started) * 1000
+                if elapsed > 200:
+                    log(f"Průjezdy {decoder_id[:8]}: potvrzení serveru {elapsed:.0f} ms")
+            except (OSError, ValueError, sqlite3.Error):
+                # Včetně ztraceného ACK: nic se nemaže, duplicity řeší server.
+                self._stop.wait(STREAM_RETRY_SECONDS)
+
+    def _pump(self, sock, pending, service, service_seconds) -> None:
+        buffer = bytearray()
+        last_service_at = time.monotonic()
+        sock.settimeout(0.1)
+        while not self._stop.is_set():
             try:
                 chunk = sock.recv(8192)
                 if not chunk:
                     raise ConnectionError("Dekodér spojení zavřel.")
                 buffer.extend(chunk)
                 if len(buffer) > STREAM_BUFFER_MAX:
-                    log(f"Proud {decoder_id[:8]} rozsypaný — buffer se zahazuje")
+                    log("Rozsypaný proud — buffer se zahazuje")
                     buffer.clear()
-                for raw in _split_frames(buffer):
-                    backlog.append(base64.b64encode(raw).decode("ascii"))
-                    last_frame_at = time.monotonic()
+                frames = _split_frames(buffer)
+                if frames:
                     _zaznamenat_smycku()
-                if len(backlog) > STREAM_BACKLOG_MAX:
-                    # Server dlouho nebere — **starší rámce na disk**, ne do
-                    # koše. Krabička jim nerozumí, ale uložit a poslat je
-                    # později umí; server jim rozumí a je mu jedno, že
-                    # dorazily se zpožděním (výsledky se počítají z časů
-                    # průjezdů). Živá dávka jde dál první, aby deska u trati
-                    # ukazovala aktuální čas a ne půlhodinu starý.
-                    prebytek = len(backlog) - STREAM_BACKLOG_MAX
-                    starsi = backlog[:prebytek]
-                    del backlog[:prebytek]
-                    ztraceno = preliv.pridej(starsi)
-                    _zaznamenat_preliv(preliv.ceka())
-                    if ztraceno:
-                        # Až tady je ztráta skutečná: plný disk nebo přeliv
-                        # přes strop. Tohle už dohledá jen člověk z dekodéru.
-                        _zaznamenat_zahozene(ztraceno)
-                        log(f"Přeliv nestačí — ztraceno {ztraceno} rámců; "
-                            f"dohledejte průjezdy z dekodéru")
-                    else:
-                        log(f"Server nebere — {prebytek} rámců odloženo "
-                            f"na disk, doletí, až se ozve")
+                    lost = pending.pridej([
+                        base64.b64encode(raw).decode("ascii") for raw in frames
+                    ])
+                    _zaznamenat_zahozene(lost)
+                    if lost:
+                        log(f"Fronta RI: {lost} rámců se nepodařilo uložit; dohledat z dekodéru")
+                    _zaznamenat_preliv(pending.ceka())
+                    self._ready.set()
             except socket.timeout:
                 pass
-
             now = time.monotonic()
-            quiet = now - last_frame_at >= STREAM_QUIET_SECONDS
-            if backlog and (quiet or len(backlog) >= STREAM_MAX_FRAMES):
-                batch = backlog[:STREAM_MAX_FRAMES]
-                try:
-                    answer = self.server.push_passings(decoder_id, batch)
-                except (urllib.error.URLError, OSError, TimeoutError, ValueError):
-                    # Server nedostupný — dávka zůstává a zkusí se s další.
-                    pass
-                else:
-                    del backlog[: len(batch)]
-                    if answer.get("ok"):
-                        _zaznamenat_prujezdy(int(answer.get("stored") or 0))
-                        # Server bere → je čas dorovnat, co leží na disku.
-                        # Jedna dávka za průchod smyčkou: doslání nesmí
-                        # zdržet `recv()`, jinak by aktuální čas na desce
-                        # zaostával o historii.
-                        self._dosli_preliv(decoder_id, preliv)
-                    else:
-                        # **„Nechci" není „zahoď".** Do verze 1.9 se taková
-                        # dávka smazala — a „žádný závod si proud neříká"
-                        # nastane po každém restartu serveru, dokud si ho
-                        # závod neřekne znovu. 12. 9. 2026 se tak u trati
-                        # ztratily dvě třetiny průjezdů (David: „zapsala se
-                        # pouze tak třetina"). Teď jde dávka na disk a doletí,
-                        # jakmile si proud někdo řekne.
-                        ztraceno = preliv.pridej(batch)
-                        _zaznamenat_preliv(preliv.ceka())
-                        if ztraceno:
-                            _zaznamenat_zahozene(ztraceno)
-                        log(f"Server dávku nevzal ({answer.get('error') or 'bez důvodu'}) "
-                            f"— {len(batch)} rámců na disk, doletí, až si proud "
-                            f"závod řekne")
-
             if now - last_service_at >= service_seconds and service:
                 sock.sendall(service)
                 last_service_at = now
@@ -1030,6 +1008,78 @@ class StreamLink:
 
 
 # --- běh na pozadí ---------------------------------------------------------
+
+
+class FrameQueue:
+    """Trvalá FIFO fronta; mazání pouze po ACK, SQLite WAL + FULL sync.
+
+    Přerušený zápis se vrátí zpět; přerušené potvrzení může zopakovat dávku,
+    nikdy však nepotvrdí rámce přijaté během HTTP požadavku.
+    """
+
+    def __init__(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=FULL")
+        self.db.execute("CREATE TABLE IF NOT EXISTS frames ("
+                        "id INTEGER PRIMARY KEY AUTOINCREMENT, received REAL NOT NULL, "
+                        "frame TEXT NOT NULL)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS frames_received ON frames(received)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS queue_size (id INTEGER PRIMARY KEY, bytes INTEGER NOT NULL)")
+        self.db.execute("INSERT OR IGNORE INTO queue_size SELECT 1, COALESCE(SUM(LENGTH(frame)), 0) FROM frames")
+        self.db.execute("CREATE TRIGGER IF NOT EXISTS frame_added AFTER INSERT ON frames "
+                        "BEGIN UPDATE queue_size SET bytes = bytes + LENGTH(NEW.frame) WHERE id = 1; END")
+        self.db.execute("CREATE TRIGGER IF NOT EXISTS frame_removed AFTER DELETE ON frames "
+                        "BEGIN UPDATE queue_size SET bytes = bytes - LENGTH(OLD.frame) WHERE id = 1; END")
+        self.db.commit()
+        self._offered = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.db.close()
+
+    def pridej(self, frames, *, received=None):
+        if not frames:
+            return 0
+        with self._lock:
+            try:
+                with self.db:
+                    used = self.db.execute(
+                        "SELECT bytes FROM queue_size WHERE id = 1"
+                    ).fetchone()[0]
+                    if used + sum(map(len, frames)) > PRELIV_MAX_BAJTU:
+                        return len(frames)
+                    self.db.executemany("INSERT INTO frames(received, frame) VALUES (?, ?)",
+                                        list(zip(received or [time.time()] * len(frames), frames)))
+                return 0
+            except sqlite3.Error:
+                return len(frames)
+
+    def ceka(self):
+        with self._lock:
+            return self.db.execute("SELECT COUNT(*) FROM frames").fetchone()[0]
+
+    def dalsi(self, limit):
+        with self._lock:
+            with self.db:
+                expired = self.db.execute("DELETE FROM frames WHERE received < ?",
+                                          (time.time() - PRELIV_MAX_DNI * 86400,)).rowcount
+            _zaznamenat_zahozene(expired)
+            rows = self.db.execute("SELECT id, frame FROM frames ORDER BY id LIMIT ?",
+                                   (limit,)).fetchall()
+            self._offered = [row[0] for row in rows]
+            return [row[1] for row in rows]
+
+    def potvrd(self):
+        with self._lock:
+            with self.db:
+                self.db.executemany("DELETE FROM frames WHERE id = ?",
+                                    [(pk,) for pk in self._offered])
+            self._offered = []
 
 
 class Preliv:
@@ -1131,6 +1181,7 @@ class Preliv:
                 with self.cesta.open("r", encoding="ascii") as soubor:
                     soubor.seek(self._posun)
                     davka, prosle = [], 0
+                    self._casy = []
                     hranice = time.time() - PRELIV_MAX_DNI * 86400
                     while len(davka) < kolik:
                         radek = soubor.readline()
@@ -1147,6 +1198,7 @@ class Preliv:
                             prosle += 1
                             continue
                         davka.append(ramec)
+                        self._casy.append(kdy)
                     self._nabidnuto = soubor.tell()
                     self._nabidnuto_pocet = len(davka) + prosle
                     self._prosle = prosle
@@ -1270,6 +1322,8 @@ class Worker:
                 link.config = dict(config)  # čerstvé otevírací rámce pro reconnect
                 continue
             link.stop()
+            if link.is_alive():
+                continue
             del self._streams[decoder_id]
             if config is None:
                 log(f"Proud {decoder_id[:8]} ukončen — závod si ho už neříká")

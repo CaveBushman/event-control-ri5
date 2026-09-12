@@ -43,7 +43,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.8"
+VERSION = "1.9"
 
 #: Kam se agent hlásí, když mu nikdo neřekl jinak. Aplikace běží na jednom
 #: místě, takže adresu nemá co obsluha u trati vypisovat — krabička po zapnutí
@@ -957,9 +957,6 @@ class StreamLink:
                     # Server nedostupný — dávka zůstává a zkusí se s další.
                     pass
                 else:
-                    # ok:false znamená „nechci" (žádný závod si proud neříká,
-                    # neznámá smyčka) — držet takovou dávku nemá smysl; co by
-                    # chybělo, server dotáhne záložkou, až si proud řekne.
                     del backlog[: len(batch)]
                     if answer.get("ok"):
                         _zaznamenat_prujezdy(int(answer.get("stored") or 0))
@@ -968,8 +965,21 @@ class StreamLink:
                         # zdržet `recv()`, jinak by aktuální čas na desce
                         # zaostával o historii.
                         self._dosli_preliv(decoder_id, preliv)
-                    elif answer.get("error"):
-                        log(f"Server dávku nevzal: {answer['error']}")
+                    else:
+                        # **„Nechci" není „zahoď".** Do verze 1.9 se taková
+                        # dávka smazala — a „žádný závod si proud neříká"
+                        # nastane po každém restartu serveru, dokud si ho
+                        # závod neřekne znovu. 12. 9. 2026 se tak u trati
+                        # ztratily dvě třetiny průjezdů (David: „zapsala se
+                        # pouze tak třetina"). Teď jde dávka na disk a doletí,
+                        # jakmile si proud někdo řekne.
+                        ztraceno = preliv.pridej(batch)
+                        _zaznamenat_preliv(preliv.ceka())
+                        if ztraceno:
+                            _zaznamenat_zahozene(ztraceno)
+                        log(f"Server dávku nevzal ({answer.get('error') or 'bez důvodu'}) "
+                            f"— {len(batch)} rámců na disk, doletí, až si proud "
+                            f"závod řekne")
 
             if now - last_service_at >= service_seconds and service:
                 sock.sendall(service)
@@ -993,10 +1003,8 @@ class StreamLink:
         except (urllib.error.URLError, OSError, TimeoutError, ValueError):
             return
         if not answer.get("ok"):
-            # „Nechci" (žádný závod si proud neříká) — držet to nemá smysl,
-            # zbytek dotáhne ruční dohledání z dekodéru.
-            preliv.potvrd()
-            _zaznamenat_preliv(preliv.ceka())
+            # „Nechci" — dávka zůstává na disku a zkusí se příště. Posun se
+            # neposouvá: potvrdit nedoručené by bylo tiché zahození (1.9).
             return
         preliv.potvrd()
         _zaznamenat_prujezdy(int(answer.get("stored") or 0))
